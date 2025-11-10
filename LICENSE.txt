@@ -1,0 +1,17 @@
+Proprietary and Confidential — Mapleton Public Schools
+
+Copyright (c) 2025 Mapleton Public Schools. All rights reserved.
+
+Permission is granted to employees and authorized contractors of Mapleton Public Schools
+to use, copy, modify, and distribute this software and its documentation
+within Mapleton Public Schools for internal business purposes only.
+
+Any distribution, publication, or use outside Mapleton Public Schools, including to
+customers, vendors, or the public, is strictly prohibited without prior
+written permission from Mapleton Public Schools.
+
+THIS SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+
+For permission requests, contact: fullerb@mapleton.com
