@@ -1,0 +1,15 @@
+# Python Dependencies for Address Geocoding Application
+
+# Geocoding library
+geocodio-library-python>=2.0.0
+
+# Database connectivity
+pyodbc>=5.0.0
+snowflake-connector-python[pandas]>=3.0.0
+
+# Data processing
+pandas>=2.0.0
+sqlalchemy>=2.0.0
+
+# Environment variable management
+python-dotenv>=1.0.0
