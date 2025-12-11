@@ -1,0 +1,51 @@
+# Git
+.git
+.gitignore
+
+# Environment files (secrets should be passed via env_file in docker-compose)
+.env
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Logs (mounted as volume instead)
+logs/
+
+# Deprecated files
+Deprecated/
+
+# Documentation and planning
+*.md
+planning/
+
+# Test files
+test*.py
+
+# License (not needed in container)
+LICENSE.txt
+
+# Config templates (not needed - using .env)
+config/
+.env.example

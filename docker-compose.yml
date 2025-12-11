@@ -1,0 +1,37 @@
+services:
+  geocoding:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: address-geocoding
+
+    # Load environment variables from .env file
+    env_file:
+      - .env
+
+    # Mount logs directory for persistent logging
+    volumes:
+      - ./logs:/app/logs
+
+    # Restart policy (optional - useful for scheduled runs)
+    # restart: "no"  # Don't restart after completion (one-shot task)
+
+    # Resource limits (optional)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '1'
+    #       memory: 1G
+
+# Optional: Add a scheduled version using cron
+  # geocoding-scheduled:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: address-geocoding-scheduled
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./logs:/app/logs
+  #   # Override command to run with cron (requires additional setup)
+  #   # command: crond -f
