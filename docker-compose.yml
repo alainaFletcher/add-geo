@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: address-geocoding:latest
     container_name: address-geocoding
 
     # Load environment variables from .env file
