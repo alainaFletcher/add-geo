@@ -34,14 +34,12 @@ The application follows a single-script architecture with three primary database
    - If accuracy >= 0.8, update IC database with coordinates and census data
    - Match LEA code to district ID using the district lookup dataframe
 
-### Configuration: config/IC_config.py
+### Configuration
 
-Contains credentials for all three services:
-- `IC_DB_Credentials`: Infinite Campus database username/password
-- `SnowflakeConnection`: Snowflake account, warehouse, database, schema
-- `Geocodeio`: API key for Geocode.io
-
-**Important**: The actual config file (`config/IC_config.py`) is gitignored. Use `config/IC_config_blank.py` as a template.
+All credentials are provided via environment variables (see `.env.example`):
+- **Snowflake**: RSA key pair authentication (`SNOWFLAKE_PRIVATE_KEY_B64` — base64-encoded PEM)
+- **Infinite Campus**: Username/password via `IC_DB_USER` / `IC_DB_PASSWORD`
+- **Geocod.io**: API key via `GEOCODIO_API_KEY`
 
 ## Running the Application
 
@@ -70,8 +68,9 @@ The script has no command-line arguments. It processes up to 500 addresses per r
 ### Snowflake Connection
 - Account: `dv56305.west-us-2.azure`
 - Warehouse: `dataloadingonly`
-- Database: `MPS_Warehouse` (note: IC_config_blank.py shows different database name)
+- Database: `MPS_Warehouse`
 - Schema: `datalake`
+- Authentication: RSA key pair (private key passed as base64-encoded PEM in `SNOWFLAKE_PRIVATE_KEY_B64`)
 
 ## Dependencies
 

@@ -12,6 +12,7 @@ import os
 import sys
 import logging
 import time
+import base64
 from typing import Optional, Tuple
 
 # Set ODBC driver path for macOS with Homebrew installation
@@ -27,6 +28,7 @@ import pyodbc
 import snowflake.connector
 from snowflake.connector import SnowflakeConnection
 import snowflake.connector.errors as sf_errors
+from cryptography.hazmat.primitives import serialization
 from dotenv import load_dotenv
 
 # Geocodio API configuration
@@ -42,7 +44,8 @@ load_dotenv()
 
 # Snowflake Data Warehouse
 SNOWFLAKE_USER = os.getenv('SNOWFLAKE_USER')
-SNOWFLAKE_PASSWORD = os.getenv('SNOWFLAKE_PASSWORD')
+SNOWFLAKE_PRIVATE_KEY_B64 = os.getenv('SNOWFLAKE_PRIVATE_KEY_B64')
+SNOWFLAKE_PRIVATE_KEY_PASSPHRASE = os.getenv('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE')  # optional
 SNOWFLAKE_ACCOUNT = os.getenv('SNOWFLAKE_ACCOUNT', 'dv56305.west-us-2.azure')
 SNOWFLAKE_WAREHOUSE = os.getenv('SNOWFLAKE_WAREHOUSE', 'dataloadingonly')
 SNOWFLAKE_DATABASE = os.getenv('SNOWFLAKE_DATABASE', 'MPS_Warehouse')
@@ -138,7 +141,7 @@ def validate_config() -> None:
     """
     required_vars = [
         'SNOWFLAKE_USER',
-        'SNOWFLAKE_PASSWORD',
+        'SNOWFLAKE_PRIVATE_KEY_B64',
         'GEOCODIO_API_KEY',
         'IC_DB_USER',
         'IC_DB_PASSWORD',
@@ -160,6 +163,53 @@ def validate_config() -> None:
 
 
 # ============================================
+# Authentication Helpers
+# ============================================
+
+def load_snowflake_private_key() -> bytes:
+    """
+    Load and decode the Snowflake RSA private key from environment variable.
+
+    The private key is expected as a base64-encoded PEM string in
+    SNOWFLAKE_PRIVATE_KEY_B64. An optional passphrase can be provided
+    in SNOWFLAKE_PRIVATE_KEY_PASSPHRASE if the key is encrypted.
+
+    Returns:
+        bytes: DER-encoded PKCS8 private key bytes (the format Snowflake expects)
+
+    Raises:
+        EnvironmentError: If the key environment variable is not set
+        ValueError: If the key cannot be decoded or parsed
+    """
+    if not SNOWFLAKE_PRIVATE_KEY_B64:
+        raise EnvironmentError("SNOWFLAKE_PRIVATE_KEY_B64 is not set")
+
+    try:
+        pem_bytes = base64.b64decode(SNOWFLAKE_PRIVATE_KEY_B64)
+    except Exception as e:
+        raise ValueError(f"Failed to base64-decode SNOWFLAKE_PRIVATE_KEY_B64: {e}")
+
+    passphrase = (
+        SNOWFLAKE_PRIVATE_KEY_PASSPHRASE.encode()
+        if SNOWFLAKE_PRIVATE_KEY_PASSPHRASE
+        else None
+    )
+
+    try:
+        private_key = serialization.load_pem_private_key(pem_bytes, password=passphrase)
+    except Exception as e:
+        raise ValueError(f"Failed to load PEM private key: {e}")
+
+    private_key_der = private_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    return private_key_der
+
+
+# ============================================
 # Database Connection Functions
 # ============================================
 
@@ -176,6 +226,9 @@ def create_snowflake_connection() -> SnowflakeConnection:
     Raises:
         Exception: If connection fails after all retries
     """
+    # Decode private key before retry loop (deterministic — no point retrying)
+    private_key_der = load_snowflake_private_key()
+
     max_retries = 3
     retry_delay = 5  # seconds
 
@@ -185,7 +238,7 @@ def create_snowflake_connection() -> SnowflakeConnection:
 
             conn = snowflake.connector.connect(
                 user=SNOWFLAKE_USER,
-                password=SNOWFLAKE_PASSWORD,
+                private_key=private_key_der,
                 account=SNOWFLAKE_ACCOUNT,
                 warehouse=SNOWFLAKE_WAREHOUSE,
                 database=SNOWFLAKE_DATABASE,

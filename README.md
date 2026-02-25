@@ -85,9 +85,10 @@ This application:
 2. Edit `.env` with your credentials:
 
    ```ini
-   # Snowflake Data Warehouse
+   # Snowflake Data Warehouse (Key Pair Auth)
    SNOWFLAKE_USER=your_username
-   SNOWFLAKE_PASSWORD=your_password
+   SNOWFLAKE_PRIVATE_KEY_B64=your_base64_encoded_private_key
+   # SNOWFLAKE_PRIVATE_KEY_PASSPHRASE=optional_passphrase
    SNOWFLAKE_ACCOUNT=dv56305.west-us-2.azure
    SNOWFLAKE_WAREHOUSE=dataloadingonly
    SNOWFLAKE_DATABASE=MPS_Warehouse
