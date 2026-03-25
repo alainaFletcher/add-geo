@@ -1,5 +1,8 @@
 # Python Dependencies for Address Geocoding Application
 
+# Structured NDJSON logging (vendored, not on PyPI)
+vendor/app_logger-2.0.0-py3-none-any.whl
+
 # HTTP requests (for Geocodio API)
 requests>=2.31.0
 

@@ -6,6 +6,7 @@ FROM python:3.13-slim
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV CONSOLE_FORMAT=json
 
 # Set working directory
 WORKDIR /app
@@ -30,8 +31,12 @@ RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy vendored dependencies (app_logger is not on PyPI)
+COPY vendor/*.whl ./
+
+# Install Python dependencies including vendored wheels
+RUN pip install --no-cache-dir *.whl -r requirements.txt \
+    && rm -f *.whl
 
 # Copy application code
 COPY GeocodeAddresses.py .
@@ -43,10 +48,6 @@ RUN mkdir -p /app/logs
 RUN useradd --create-home --shell /bin/bash appuser \
     && chown -R appuser:appuser /app
 USER appuser
-
-# Health check (optional - checks if Python can import the app)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import GeocodeAddresses" || exit 1
 
 # Run the application
 CMD ["python", "GeocodeAddresses.py"]

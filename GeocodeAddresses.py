@@ -13,7 +13,9 @@ import sys
 import logging
 import time
 import base64
-from typing import Optional, Tuple
+from typing import Tuple
+
+from app_logger import AppLogger, ExitCode
 
 # Set ODBC driver path for macOS with Homebrew installation
 # This must be done before importing pyodbc
@@ -64,7 +66,6 @@ IC_DB_DRIVER = os.getenv('IC_DB_DRIVER', 'ODBC Driver 18 for SQL Server')
 # Application Settings
 BATCH_SIZE = int(os.getenv('BATCH_SIZE', '500'))
 ACCURACY_THRESHOLD = float(os.getenv('ACCURACY_THRESHOLD', '0.8'))
-LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 API_FIELDS = ["school", "zip4", "census2024"]
 
 # SQL Queries
@@ -80,48 +81,9 @@ QUERY_DISTRICTS = """
 """
 
 
-# ============================================
-# Logging Configuration
-# ============================================
-
-def setup_logging() -> logging.Logger:
-    """
-    Configure logging for both console (Docker) and file output.
-
-    Docker best practice: log to stdout for 'docker logs' command.
-    Also write to file for persistent debugging.
-
-    Returns:
-        logging.Logger: Configured logger instance
-    """
-    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    log_level = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
-
-    # Create logger
-    logger = logging.getLogger('geocoding')
-    logger.setLevel(log_level)
-
-    # Console handler (for Docker logs and terminal output)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(logging.Formatter(log_format))
-    logger.addHandler(console_handler)
-
-    # File handler (for persistent logs)
-    # Check if logs directory exists, create if in Docker environment
-    log_dir = '/app/logs' if os.path.exists('/app') else './logs'
-    os.makedirs(log_dir, exist_ok=True)
-
-    file_handler = logging.FileHandler(f'{log_dir}/geocoding.log')
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter(log_format))
-    logger.addHandler(file_handler)
-
-    return logger
-
-
-# Initialize logger
-logger = setup_logging()
+# Module-level logger — AppLogger's configure_root_logger=True attaches
+# NDJSON handlers to the root logger, so this automatically gets structured output.
+logger = logging.getLogger(__name__)
 
 
 # ============================================
@@ -152,14 +114,9 @@ def validate_config() -> None:
     if missing:
         error_msg = f"Missing required environment variables: {', '.join(missing)}"
         logger.error(error_msg)
-        logger.error("Please check your .env file or environment configuration")
         raise EnvironmentError(error_msg)
 
-    logger.info("Configuration validated successfully")
-    logger.info(f"Batch size: {BATCH_SIZE}")
-    logger.info(f"Accuracy threshold: {ACCURACY_THRESHOLD}")
-    logger.info(f"Snowflake database: {SNOWFLAKE_DATABASE}.{SNOWFLAKE_SCHEMA}")
-    logger.info(f"IC database: {IC_DB_SERVER}/{IC_DB_DATABASE}")
+    logger.info("Configuration validated")
 
 
 # ============================================
@@ -340,12 +297,14 @@ def fetch_addresses_to_geocode(snowflake_conn: SnowflakeConnection,
     Raises:
         Exception: If query fails
     """
+    if not isinstance(limit, int) or limit <= 0:
+        raise ValueError(f"limit must be a positive integer, got {limit!r}")
+
     try:
         logger.info(f"Fetching up to {limit} addresses from Snowflake...")
 
         cursor = snowflake_conn.cursor()
 
-        # Format query with limit
         query = QUERY_ADDRESSES.format(limit=limit)
 
         # Execute query and fetch results as DataFrame
@@ -358,9 +317,6 @@ def fetch_addresses_to_geocode(snowflake_conn: SnowflakeConnection,
 
         if len(df) == 0:
             logger.warning("No addresses found that need geocoding")
-        else:
-            logger.debug(f"Address columns: {df.columns.tolist()}")
-            logger.debug(f"First address: {df.iloc[0]['ADDRESSLINE1'] if len(df) > 0 else 'N/A'}")
 
         return df
 
@@ -436,7 +392,7 @@ def geocode_address(address: str, api_key: str, fields: list) -> dict:
         "api_key": api_key,
         "fields": ",".join(fields)
     }
-    response = requests.get(GEOCODIO_API_URL, params=params)
+    response = requests.get(GEOCODIO_API_URL, params=params, timeout=30)
     response.raise_for_status()
     return response.json()
 
@@ -459,7 +415,6 @@ def batch_geocode_addresses(addresses_df: pd.DataFrame, api_key: str) -> list:
         requests.exceptions.HTTPError: If API returns 401 (authentication error)
     """
     logger.info(f"Geocoding {len(addresses_df)} addresses individually...")
-    logger.debug(f"API fields requested: {API_FIELDS}")
 
     results = []
     success_count = 0
@@ -470,40 +425,33 @@ def batch_geocode_addresses(addresses_df: pd.DataFrame, api_key: str) -> list:
         address_id = row['ADDRESSID']
 
         try:
-            # Single API call per address
-            logger.debug(f"API Fields: {API_FIELDS}")
             response = geocode_address(address, api_key, API_FIELDS)
             results.append(response)
             success_count += 1
 
             if (idx + 1) % 50 == 0:
-                logger.info(f"Progress: {idx + 1}/{len(addresses_df)} addresses geocoded...")
+                logger.info(f"Geocoding progress: {success_count} succeeded, {error_count} failed of {idx + 1} processed")
 
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
-                logger.error(f"Geocodio API authentication failed: {e}")
-                logger.error("Action required: Check GEOCODIO_API_KEY in .env file")
+                logger.error("Geocodio API authentication failed")
                 raise
             elif e.response.status_code == 422:
-                logger.error(f"Invalid geocoding request for address ID {address_id}: {e}")
-                logger.error(f"Address: {address}")
+                logger.warning(f"Invalid geocoding request for address ID {address_id}")
                 results.append(None)
                 error_count += 1
             else:
-                logger.warning(f"HTTP error geocoding address ID {address_id}: {e}")
-                logger.warning(f"Address: {address}")
+                logger.warning(f"HTTP error geocoding address ID {address_id}: status {e.response.status_code}")
                 results.append(None)
                 error_count += 1
 
         except requests.exceptions.RequestException as e:
-            logger.warning(f"Request error geocoding address ID {address_id}: {e}")
-            logger.warning(f"Address: {address}")
+            logger.warning(f"Request error geocoding address ID {address_id}: {type(e).__name__}")
             results.append(None)
             error_count += 1
 
         except Exception as e:
-            logger.warning(f"Error geocoding address ID {address_id}: {e}")
-            logger.warning(f"Address: {address}")
+            logger.warning(f"Error geocoding address ID {address_id}: {type(e).__name__}")
             results.append(None)
             error_count += 1
 
@@ -554,7 +502,7 @@ def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.D
 
             # Check if this address had an error (result is None)
             if address_result is None:
-                logger.warning(f"No results for address ID {original_addressid}: {original_address}")
+                logger.warning(f"No results for address ID {original_addressid}")
                 parsed_rows.append({
                     'ADDRESSID': original_addressid,
                     'ADDRESSLINE1': original_address,
@@ -576,7 +524,7 @@ def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.D
             # Check if API returned no results for this address
             results_list = address_result.get('results', [])
             if len(results_list) == 0:
-                logger.warning(f"No geocoding results for address ID {original_addressid}: {original_address}")
+                logger.warning(f"No geocoding results for address ID {original_addressid}")
                 parsed_rows.append({
                     'ADDRESSID': original_addressid,
                     'ADDRESSLINE1': original_address,
@@ -605,15 +553,7 @@ def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.D
             accuracy_type = result.get('accuracy_type')
             source = result.get('source')
 
-            # DEBUG: Show what fields are available (for first few addresses)
             fields = result.get('fields', {})
-            if idx < 3:  # Only show for first 3 addresses to avoid spam
-                logger.info(f"DEBUG - Address ID {original_addressid}: {original_address}")
-                logger.info(f"DEBUG - Geocoded to: {latitude}, {longitude} (accuracy: {accuracy})")
-                logger.info(f"DEBUG - Fields available: {list(fields.keys()) if fields else 'None'}")
-                if fields:
-                    logger.info(f"DEBUG - School districts: {fields.get('school_districts')}")
-                    logger.info(f"DEBUG - Census 2024: {fields.get('census', {}).get('2024')}")
 
             # Extract census data (2024) and school district data
             # Note: fields might be empty if not requested or not available with API key
@@ -640,10 +580,6 @@ def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.D
                     if unified:
                         lea_code = unified.get('lea_code', '0000')
                         district_name = unified.get('name', 'none')
-
-                        # DEBUG: Show what LEA code we got
-                        if idx < 3:
-                            logger.info(f"DEBUG - Extracted LEA code: {lea_code}, District: {district_name}")
 
             # Add parsed result
             parsed_rows.append({
@@ -698,19 +634,11 @@ def enrich_with_district_ids(results_df: pd.DataFrame, districts_df: pd.DataFram
     try:
         logger.info("Enriching results with district IDs...")
 
-        # DEBUG: Show what's in the districts lookup table
-        logger.info(f"DEBUG - Districts lookup table has {len(districts_df)} entries")
-        logger.info(f"DEBUG - Sample NCES IDs in lookup: {list(districts_df.index[:5])}")
-
         # Initialize DISTRICTID column
         results_df['DISTRICTID'] = 0
 
         # Only process successful geocoding results
         successful_mask = results_df['success'] == True
-
-        # DEBUG: Show unique LEA codes we're trying to match
-        unique_leas = results_df[successful_mask]['lea_code'].unique()
-        logger.info(f"DEBUG - Unique LEA codes to match: {unique_leas}")
 
         for idx in results_df[successful_mask].index:
             lea_code = results_df.at[idx, 'lea_code']
@@ -726,12 +654,11 @@ def enrich_with_district_ids(results_df: pd.DataFrame, districts_df: pd.DataFram
             if nces_id in districts_df.index:
                 district_id = districts_df.loc[nces_id, 'DISTRICTID']
                 results_df.at[idx, 'DISTRICTID'] = int(district_id)
-                logger.info(f"✓ Matched LEA {nces_id} to District ID {district_id}")
+                logger.debug(f"Matched LEA {nces_id} to District ID {district_id}")
             else:
-                # District not found - log for review
                 logger.warning(
-                    f"✗ No district match for address ID {results_df.at[idx, 'ADDRESSID']}: "
-                    f"LEA code {nces_id} ({results_df.at[idx, 'district_name']})"
+                    f"No district match for address ID {results_df.at[idx, 'ADDRESSID']}: "
+                    f"LEA code {nces_id}"
                 )
                 results_df.at[idx, 'DISTRICTID'] = 0
 
@@ -786,17 +713,14 @@ def log_results_to_snowflake(results_df: pd.DataFrame, snowflake_conn: Snowflake
                 continue
 
             try:
-                # Convert response to JSON string and escape single quotes
                 json_text = json.dumps(raw_response)
-                json_text = json_text.replace("'", "''")
 
-                # Insert into Snowflake logging table
-                insert_sql = f"""
+                insert_sql = """
                     INSERT INTO LOGGING_GEOCODIOAPI_ADDRESSLOOKUPS (IC_ADDRESSID, GEOCODIO_JSON)
-                    SELECT {address_id}, PARSE_JSON('{json_text}')
+                    SELECT %s, PARSE_JSON(%s)
                 """
 
-                cursor.execute(insert_sql)
+                cursor.execute(insert_sql, (address_id, json_text))
                 success_count += 1
 
                 if (success_count + error_count) % 100 == 0:
@@ -901,9 +825,7 @@ def update_ic_addresses(results_df: pd.DataFrame, ic_conn: pyodbc.Connection,
                     logger.info(f"IC update progress: {success_count} addresses updated...")
 
             except pyodbc.Error as e:
-                logger.warning(f"Failed to update address ID {address_id} in IC: {e}")
-                logger.debug(f"SQL: {sql_update}")
-                logger.debug(f"Args: {args}")
+                logger.warning(f"Failed to update address ID {address_id} in IC: {type(e).__name__}")
                 error_count += 1
 
             except Exception as e:
@@ -921,131 +843,85 @@ def update_ic_addresses(results_df: pd.DataFrame, ic_conn: pyodbc.Connection,
 # Main Execution
 # ============================================
 
-def main() -> int:
+def main() -> None:
     """
     Main execution function.
 
-    Orchestrates the entire geocoding process:
-    1. Validate configuration
-    2. Connect to databases
-    3. Fetch addresses to geocode
-    4. (Future) Geocode addresses
-    5. (Future) Update databases
-
-    Returns:
-        int: Exit code (0 for success, non-zero for error)
+    Orchestrates the entire geocoding process using AppLogger
+    for structured NDJSON logging with step-level observability.
     """
-    start_time = time.time()
+    log = AppLogger(
+        "Address_Geocoding",
+        job="daily_geocode",
+        configure_root_logger=True,
+        purge_on_init=True,
+    )
+    log.start(trigger="cron", schedule="0 17 * * *")
 
     try:
-        logger.info("=" * 60)
-        logger.info("Starting Address Geocoding Application v2.0")
-        logger.info("=" * 60)
+        with log.step("validate_config") as s:
+            validate_config()
+            if not GEOCODIO_API_KEY:
+                raise EnvironmentError("GEOCODIO_API_KEY is not set")
 
-        # Step 1: Validate configuration
-        logger.info("Step 1: Validating configuration...")
-        validate_config()
-
-        # Step 2: Validate Geocodio API key
-        logger.info("Step 2: Validating Geocodio API key...")
-        if not GEOCODIO_API_KEY:
-            raise EnvironmentError("GEOCODIO_API_KEY is not set")
-        logger.info("Geocodio API key validated")
-
-        # Step 3: Connect to Snowflake
-        logger.info("Step 3: Connecting to Snowflake...")
         with create_snowflake_connection() as sf_conn:
 
-            # Step 4: Fetch addresses to geocode
-            logger.info("Step 4: Fetching addresses to geocode...")
-            addresses_df = fetch_addresses_to_geocode(sf_conn, BATCH_SIZE)
+            with log.step("fetch_addresses") as s:
+                addresses_df = fetch_addresses_to_geocode(sf_conn, BATCH_SIZE)
+                s.rows = len(addresses_df)
+                if len(addresses_df) == 0:
+                    s.status = "SKIPPED"
 
             if len(addresses_df) == 0:
-                logger.info("No addresses to process. Exiting.")
-                return 0
+                log.info("No addresses need geocoding")
+                log.finish(override_status="SKIPPED")
+                return
 
-            # Step 5: Fetch district lookup table
-            logger.info("Step 5: Fetching district lookup table...")
-            districts_df = fetch_district_lookup(sf_conn)
+            with log.step("fetch_districts") as s:
+                districts_df = fetch_district_lookup(sf_conn)
+                s.rows = len(districts_df)
 
-            logger.info(f"Addresses fetched: {len(addresses_df)}")
-            logger.info(f"Districts in lookup: {len(districts_df)}")
+            with log.step("geocode_addresses") as s:
+                api_results = batch_geocode_addresses(addresses_df, GEOCODIO_API_KEY)
+                results_df = parse_geocode_results(api_results, addresses_df)
+                success_count = int(results_df['success'].sum())
+                failed_count = int((~results_df['success']).sum())
+                s.rows = success_count
+                s.rows_failed = failed_count
+                if success_count > 0:
+                    s.metadata["avg_accuracy"] = round(
+                        results_df[results_df['success']]['accuracy'].mean(), 3
+                    )
 
-            # Step 6: Geocode all addresses (individual API calls)
-            logger.info("Step 6: Geocoding addresses...")
-            api_results = batch_geocode_addresses(addresses_df, GEOCODIO_API_KEY)
+            with log.step("enrich_districts") as s:
+                results_df = enrich_with_district_ids(results_df, districts_df)
+                matched = int((results_df['DISTRICTID'] > 0).sum())
+                s.rows = matched
+                s.metadata["district_match_rate"] = round(
+                    matched / len(results_df), 3
+                ) if len(results_df) > 0 else 0.0
 
-            # Step 7: Parse geocoding results
-            logger.info("Step 7: Parsing geocoding results...")
-            results_df = parse_geocode_results(api_results, addresses_df)
+            with log.step("log_to_snowflake", fatal=False) as s:
+                sf_success, sf_errors_count = log_results_to_snowflake(results_df, sf_conn)
+                s.rows = sf_success
+                s.rows_failed = sf_errors_count
 
-            # Step 8: Enrich with district IDs
-            logger.info("Step 8: Enriching with district IDs...")
-            results_df = enrich_with_district_ids(results_df, districts_df)
+            with log.step("update_ic") as s:
+                ic_conn = create_ic_connection()
+                try:
+                    ic_success, ic_errors_count = update_ic_addresses(results_df, ic_conn)
+                    s.rows = ic_success
+                    s.rows_failed = ic_errors_count
+                    s.metadata["skipped_below_threshold"] = (
+                        len(results_df) - ic_success - ic_errors_count
+                    )
+                finally:
+                    ic_conn.close()
 
-            # Log summary of results
-            logger.info("=" * 60)
-            logger.info("GEOCODING RESULTS SUMMARY")
-            logger.info("=" * 60)
-            logger.info(f"Total addresses processed:    {len(results_df)}")
-            logger.info(f"Successfully geocoded:        {results_df['success'].sum()}")
-            logger.info(f"Failed to geocode:            {(~results_df['success']).sum()}")
-            logger.info(f"Matched to districts:         {(results_df['DISTRICTID'] > 0).sum()}")
-            logger.info(f"Average accuracy:             {results_df[results_df['success']]['accuracy'].mean():.3f}")
-            logger.info("=" * 60)
-
-            # Step 9: Log results to Snowflake
-            logger.info("Step 9: Logging results to Snowflake...")
-            sf_success, sf_errors_count = log_results_to_snowflake(results_df, sf_conn)
-            logger.info(f"Snowflake logging: {sf_success} logged, {sf_errors_count} errors")
-
-            # Step 10: Connect to IC and update addresses
-            logger.info("Step 10: Updating Infinite Campus database...")
-            ic_conn = create_ic_connection()
-            try:
-                ic_success, ic_errors_count = update_ic_addresses(results_df, ic_conn)
-                logger.info(f"IC update: {ic_success} updated, {ic_errors_count} errors")
-            finally:
-                ic_conn.close()
-                logger.info("Infinite Campus connection closed")
-
-        # Calculate duration
-        duration = time.time() - start_time
-
-        logger.info("=" * 60)
-        logger.info(f"Application completed successfully in {duration:.1f} seconds")
-        logger.info("=" * 60)
-
-        return 0
-
-    except EnvironmentError as e:
-        logger.error(f"Configuration error: {e}")
-        return 1
-
-    except requests.exceptions.HTTPError as e:
-        if hasattr(e, 'response') and e.response.status_code == 401:
-            logger.error(f"Geocodio API authentication error: {e}")
-            return 2
-        logger.error(f"Geocodio API HTTP error: {e}")
-        return 3
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Geocodio API request error: {e}")
-        return 4
-
-    except sf_errors.ProgrammingError as e:
-        logger.error(f"Snowflake database error: {e}")
-        return 5
-
-    except pyodbc.Error as e:
-        logger.error(f"Infinite Campus database error: {e}")
-        return 6
-
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        return 7
+    finally:
+        status = log.finish()
+        sys.exit(ExitCode.SUCCESS if status in ("SUCCESS", "PARTIAL", "SKIPPED") else ExitCode.FAILED)
 
 
 if __name__ == "__main__":
-    exit_code = main()
-    sys.exit(exit_code)
+    main()
