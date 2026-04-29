@@ -170,12 +170,20 @@ def load_snowflake_private_key() -> bytes:
 # Database Connection Functions
 # ============================================
 
-def create_snowflake_connection() -> SnowflakeConnection:
+def create_snowflake_connection(database: str = SNOWFLAKE_DATABASE,
+                                schema: str | None = None) -> SnowflakeConnection:
     """
     Create Snowflake connection with retry logic.
 
     Containers may start before network is fully ready,
     so we retry connection attempts with exponential backoff.
+
+    Args:
+        database: Snowflake database to connect to (default: SNOWFLAKE_DATABASE).
+            Pass "LOGS" to open a connection scoped for app_logger dual-write.
+        schema: Optional schema. If omitted, defaults to SNOWFLAKE_SCHEMA only when
+            the database matches the configured warehouse database; otherwise the
+            connection has no default schema (caller uses fully-qualified names).
 
     Returns:
         SnowflakeConnection: Active Snowflake connection
@@ -186,23 +194,30 @@ def create_snowflake_connection() -> SnowflakeConnection:
     # Decode private key before retry loop (deterministic — no point retrying)
     private_key_der = load_snowflake_private_key()
 
+    effective_schema = schema if schema is not None else (
+        SNOWFLAKE_SCHEMA if database == SNOWFLAKE_DATABASE else None
+    )
+
     max_retries = 3
     retry_delay = 5  # seconds
 
     for attempt in range(1, max_retries + 1):
         try:
-            logger.info(f"Connecting to Snowflake (attempt {attempt}/{max_retries})...")
+            logger.info(f"Connecting to Snowflake [{database}] (attempt {attempt}/{max_retries})...")
 
-            conn = snowflake.connector.connect(
+            connect_kwargs = dict(
                 user=SNOWFLAKE_USER,
                 private_key=private_key_der,
                 account=SNOWFLAKE_ACCOUNT,
                 warehouse=SNOWFLAKE_WAREHOUSE,
-                database=SNOWFLAKE_DATABASE,
-                schema=SNOWFLAKE_SCHEMA
+                database=database,
             )
+            if effective_schema:
+                connect_kwargs["schema"] = effective_schema
 
-            logger.info("Successfully connected to Snowflake")
+            conn = snowflake.connector.connect(**connect_kwargs)
+
+            logger.info(f"Successfully connected to Snowflake [{database}]")
             return conn
 
         except sf_errors.ProgrammingError as e:
@@ -850,11 +865,23 @@ def main() -> None:
     Orchestrates the entire geocoding process using AppLogger
     for structured NDJSON logging with step-level observability.
     """
+    # Open a dedicated Snowflake connection for app_logger dual-write.
+    # Best-effort: if Snowflake is unreachable, log locally and continue without
+    # remote logging. The local NDJSON files remain the durable record.
+    sf_log_conn = None
+    try:
+        sf_log_conn = create_snowflake_connection(database="LOGS")
+    except Exception as exc:
+        # We don't have AppLogger yet, so use stdlib logging.
+        logging.warning("Could not open Snowflake connection for app_logger: %s", exc)
+
     log = AppLogger(
         "Address_Geocoding",
         job="daily_geocode",
         configure_root_logger=True,
         purge_on_init=True,
+        snowflake_connection=sf_log_conn,
+        notify=True,
     )
     log.start(trigger="cron", schedule="0 17 * * *")
 
@@ -920,6 +947,11 @@ def main() -> None:
 
     finally:
         status = log.finish()
+        if sf_log_conn is not None:
+            try:
+                sf_log_conn.close()
+            except Exception:
+                pass
         sys.exit(ExitCode.SUCCESS if status in ("SUCCESS", "PARTIAL", "SKIPPED") else ExitCode.FAILED)
 
 
