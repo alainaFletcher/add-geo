@@ -959,8 +959,15 @@ def main() -> None:
                 s.rows = success_count
                 s.rows_failed = failed_count
                 if success_count > 0:
+                    successful = results_df[results_df['success']]
                     s.metadata["avg_accuracy"] = round(
-                        results_df[results_df['success']]['accuracy'].mean(), 3
+                        successful['accuracy'].mean(), 3
+                    )
+                    census_complete = successful[
+                        successful['tract_code'].notna() & successful['block_code'].notna()
+                    ]
+                    s.metadata["census_enrichment_rate"] = round(
+                        len(census_complete) / success_count, 3
                     )
 
             with log.step("enrich_districts") as s:
