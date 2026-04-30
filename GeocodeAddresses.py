@@ -475,6 +475,29 @@ def batch_geocode_addresses(addresses_df: pd.DataFrame, api_key: str) -> list:
     return results
 
 
+def _failed_row(addressid, addressline1, raw_response) -> dict:
+    """Canonical failed-row shape used when geocoding cannot produce coordinates.
+
+    Centralized here so changes to the parser output schema only happen in one place.
+    """
+    return {
+        'ADDRESSID': addressid,
+        'ADDRESSLINE1': addressline1,
+        'success': False,
+        'latitude': None,
+        'longitude': None,
+        'accuracy': 0.0,
+        'accuracy_type': None,
+        'source': None,
+        'block_code': None,
+        'tract_code': None,
+        'county_fips': None,
+        'lea_code': '0000',
+        'district_name': 'none',
+        'raw_response': raw_response,
+    }
+
+
 def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.DataFrame:
     """
     Parse Geocodio API results into structured DataFrame.
