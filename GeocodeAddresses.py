@@ -34,7 +34,8 @@ from cryptography.hazmat.primitives import serialization
 from dotenv import load_dotenv
 
 # Geocodio API configuration
-GEOCODIO_API_URL = "https://api.geocod.io/v1.9/geocode"
+GEOCODIO_API_VERSION = os.getenv('GEOCODIO_API_VERSION', 'v1.12')
+GEOCODIO_API_URL = f"https://api.geocod.io/{GEOCODIO_API_VERSION}/geocode"
 
 # Load environment variables from .env file
 load_dotenv()
@@ -160,7 +161,7 @@ def validate_config() -> None:
         logger.error(error_msg)
         raise EnvironmentError(error_msg)
 
-    logger.info("Configuration validated")
+    logger.info(f"Configuration validated (Geocodio API version: {GEOCODIO_API_VERSION})")
 
 
 # ============================================
