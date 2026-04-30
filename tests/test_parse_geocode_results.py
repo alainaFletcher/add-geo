@@ -44,3 +44,55 @@ def test_failed_row_helper_consistency():
         "district_name": "none",
         "raw_response": {"results": []},
     }
+
+
+import pandas as pd  # noqa: E402
+
+
+def _addresses_df():
+    return pd.DataFrame([{"ADDRESSID": 42, "ADDRESSLINE1": "13515 Thornton Pkwy"}])
+
+
+def test_success_extracts_all_fields():
+    """Parser extracts location, accuracy, census, and school district from a real v1.9 response."""
+    fixture = _load("geocodio_v19_with_deprecation.json")
+    df = ga.parse_geocode_results([fixture], _addresses_df())
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["success"]
+    assert row["latitude"] == 39.870709
+    assert row["longitude"] == -104.968308
+    assert row["accuracy"] == 0.59
+    assert row["accuracy_type"] == "street_center"
+    assert row["block_code"] == "2013"
+    assert row["tract_code"] == "009204"
+    assert row["county_fips"] == "08001"
+    assert row["lea_code"] == "0806900"
+    assert row["district_name"] == "Adams 12 Five Star Schools"
+    assert row["raw_response"] == fixture
+
+
+def test_no_results_returns_failed_row():
+    """An API response with results=[] yields a failed row, not an exception."""
+    fixture = _load("geocodio_v19_no_results.json")
+    df = ga.parse_geocode_results([fixture], _addresses_df())
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert not row["success"]
+    assert row["latitude"] is None
+    assert row["longitude"] is None
+    assert row["lea_code"] == "0000"
+    assert row["district_name"] == "none"
+    assert row["raw_response"] == fixture
+
+
+def test_missing_location_returns_failed_row():
+    """A result missing the location key does not raise — it produces a failed row."""
+    fixture = _load("geocodio_v19_missing_location.json")
+    df = ga.parse_geocode_results([fixture], _addresses_df())
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert not row["success"]
+    assert row["latitude"] is None
+    assert row["longitude"] is None
+    assert row["raw_response"] == fixture

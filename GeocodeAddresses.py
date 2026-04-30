@@ -541,52 +541,27 @@ def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.D
             # Check if this address had an error (result is None)
             if address_result is None:
                 logger.warning(f"No results for address ID {original_addressid}")
-                parsed_rows.append({
-                    'ADDRESSID': original_addressid,
-                    'ADDRESSLINE1': original_address,
-                    'success': False,
-                    'latitude': None,
-                    'longitude': None,
-                    'accuracy': 0.0,
-                    'accuracy_type': None,
-                    'source': None,
-                    'block_code': None,
-                    'tract_code': None,
-                    'county_fips': None,
-                    'lea_code': '0000',
-                    'district_name': 'none',
-                    'raw_response': None
-                })
+                parsed_rows.append(_failed_row(original_addressid, original_address, None))
                 continue
 
             # Check if API returned no results for this address
             results_list = address_result.get('results', [])
             if len(results_list) == 0:
                 logger.warning(f"No geocoding results for address ID {original_addressid}")
-                parsed_rows.append({
-                    'ADDRESSID': original_addressid,
-                    'ADDRESSLINE1': original_address,
-                    'success': False,
-                    'latitude': None,
-                    'longitude': None,
-                    'accuracy': 0.0,
-                    'accuracy_type': None,
-                    'source': None,
-                    'block_code': None,
-                    'tract_code': None,
-                    'county_fips': None,
-                    'lea_code': '0000',
-                    'district_name': 'none',
-                    'raw_response': address_result
-                })
+                parsed_rows.append(_failed_row(original_addressid, original_address, address_result))
                 continue
 
             # Get the first (best) result
             result = results_list[0]
 
-            # Extract basic location data
-            latitude = result['location']['lat']
-            longitude = result['location']['lng']
+            # Extract basic location data — guard against missing/null location.
+            location = result.get('location') or {}
+            latitude = location.get('lat')
+            longitude = location.get('lng')
+            if latitude is None or longitude is None:
+                logger.warning(f"Missing location for address ID {original_addressid}")
+                parsed_rows.append(_failed_row(original_addressid, original_address, address_result))
+                continue
             accuracy = result.get('accuracy', 0.0)
             accuracy_type = result.get('accuracy_type')
             source = result.get('source')
