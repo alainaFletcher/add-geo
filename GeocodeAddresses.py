@@ -33,10 +33,6 @@ import snowflake.connector.errors as sf_errors
 from cryptography.hazmat.primitives import serialization
 from dotenv import load_dotenv
 
-# Geocodio API configuration
-GEOCODIO_API_VERSION = os.getenv('GEOCODIO_API_VERSION', 'v1.12')
-GEOCODIO_API_URL = f"https://api.geocod.io/{GEOCODIO_API_VERSION}/geocode"
-
 # Load environment variables from .env file
 load_dotenv()
 
@@ -56,6 +52,8 @@ SNOWFLAKE_SCHEMA = os.getenv('SNOWFLAKE_SCHEMA', 'datalake')
 
 # Geocodio API
 GEOCODIO_API_KEY = os.getenv('GEOCODIO_API_KEY')
+GEOCODIO_API_VERSION = os.getenv('GEOCODIO_API_VERSION', 'v1.12')
+GEOCODIO_API_URL = f"https://api.geocod.io/{GEOCODIO_API_VERSION}/geocode"
 
 # Infinite Campus Database (SQL Server)
 IC_DB_SERVER = os.getenv('IC_DB_SERVER', 'icampus.mapleton.us,7771')
