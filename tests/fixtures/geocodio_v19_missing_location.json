@@ -1,0 +1,230 @@
+{
+  "_warnings": [
+    "There is a newer API version available, please consider upgrading to v1.12. See changelog here: https://www.geocod.io/docs/#changelog"
+  ],
+  "input": {
+    "address_components": {
+      "city": "Thornton",
+      "country": "US",
+      "formatted_street": "Thornton Pkwy",
+      "number": "13515",
+      "state": "CO",
+      "street": "Thornton",
+      "suffix": "Pkwy",
+      "zip": "80241"
+    },
+    "formatted_address": "13515 Thornton Pkwy, Thornton, CO 80241"
+  },
+  "results": [
+    {
+      "accuracy": 0.59,
+      "accuracy_type": "street_center",
+      "address_components": {
+        "city": "Thornton",
+        "country": "US",
+        "county": "Adams County",
+        "formatted_street": "Thornton Pkwy",
+        "state": "CO",
+        "street": "Thornton",
+        "suffix": "Pkwy",
+        "zip": "80229"
+      },
+      "address_lines": [
+        "Thornton Pkwy",
+        "",
+        "Thornton, CO 80229"
+      ],
+      "fields": {
+        "census": {
+          "2024": {
+            "block_code": "2013",
+            "block_group": "2",
+            "census_year": 2024,
+            "combined_statistical_area": {
+              "area_code": "216",
+              "name": "Denver-Aurora-Greeley, CO"
+            },
+            "county_fips": "08001",
+            "county_subdivision": {
+              "fips": "93800",
+              "fips_class": {
+                "class_code": "Z5",
+                "description": "A statistical county subdivision"
+              },
+              "name": "West Adams"
+            },
+            "full_fips": "080010092042013",
+            "metro_micro_statistical_area": {
+              "area_code": "19740",
+              "name": "Denver-Aurora-Centennial, CO",
+              "type": "metropolitan"
+            },
+            "metropolitan_division": null,
+            "place": {
+              "fips": "0877290",
+              "name": "Thornton"
+            },
+            "source": "US Census Bureau",
+            "state_fips": "08",
+            "tract_code": "009204"
+          }
+        },
+        "school_districts": {
+          "unified": {
+            "grade_high": "12",
+            "grade_low": "PK",
+            "lea_code": "0806900",
+            "name": "Adams 12 Five Star Schools"
+          }
+        }
+      },
+      "formatted_address": "Thornton Pkwy, Thornton, CO 80229",
+      "match_type": null,
+      "source": "TIGER/Line\u00ae dataset from the US Census Bureau",
+      "stable_address_key": "gcod_usspxrflcnhxfqqg"
+    },
+    {
+      "accuracy": 0.59,
+      "accuracy_type": "street_center",
+      "address_components": {
+        "city": "Denver",
+        "country": "US",
+        "county": "Adams County",
+        "formatted_street": "Thornton Pkwy",
+        "state": "CO",
+        "street": "Thornton",
+        "suffix": "Pkwy",
+        "zip": "80260"
+      },
+      "address_lines": [
+        "Thornton Pkwy",
+        "",
+        "Denver, CO 80260"
+      ],
+      "fields": {
+        "census": {
+          "2024": {
+            "block_code": "3002",
+            "block_group": "3",
+            "census_year": 2024,
+            "combined_statistical_area": {
+              "area_code": "216",
+              "name": "Denver-Aurora-Greeley, CO"
+            },
+            "county_fips": "08001",
+            "county_subdivision": {
+              "fips": "93800",
+              "fips_class": {
+                "class_code": "Z5",
+                "description": "A statistical county subdivision"
+              },
+              "name": "West Adams"
+            },
+            "full_fips": "080010093043002",
+            "metro_micro_statistical_area": {
+              "area_code": "19740",
+              "name": "Denver-Aurora-Centennial, CO",
+              "type": "metropolitan"
+            },
+            "metropolitan_division": null,
+            "place": {
+              "fips": "0877290",
+              "name": "Thornton"
+            },
+            "source": "US Census Bureau",
+            "state_fips": "08",
+            "tract_code": "009304"
+          }
+        },
+        "school_districts": {
+          "unified": {
+            "grade_high": "12",
+            "grade_low": "PK",
+            "lea_code": "0806900",
+            "name": "Adams 12 Five Star Schools"
+          }
+        }
+      },
+      "formatted_address": "Thornton Pkwy, Denver, CO 80260",
+      "location": {
+        "lat": 39.865371,
+        "lng": -104.99363
+      },
+      "match_type": null,
+      "source": "TIGER/Line\u00ae dataset from the US Census Bureau",
+      "stable_address_key": "gcod_ussnsfc25tmvtxz4"
+    },
+    {
+      "accuracy": 0.56,
+      "accuracy_type": "street_center",
+      "address_components": {
+        "city": "Denver",
+        "country": "US",
+        "county": "Adams County",
+        "formatted_street": "W Thornton Pkwy",
+        "predirectional": "W",
+        "state": "CO",
+        "street": "Thornton",
+        "suffix": "Pkwy",
+        "zip": "80260"
+      },
+      "address_lines": [
+        "W Thornton Pkwy",
+        "",
+        "Denver, CO 80260"
+      ],
+      "fields": {
+        "census": {
+          "2024": {
+            "block_code": "1006",
+            "block_group": "1",
+            "census_year": 2024,
+            "combined_statistical_area": {
+              "area_code": "216",
+              "name": "Denver-Aurora-Greeley, CO"
+            },
+            "county_fips": "08001",
+            "county_subdivision": {
+              "fips": "93800",
+              "fips_class": {
+                "class_code": "Z5",
+                "description": "A statistical county subdivision"
+              },
+              "name": "West Adams"
+            },
+            "full_fips": "080010093161006",
+            "metro_micro_statistical_area": {
+              "area_code": "19740",
+              "name": "Denver-Aurora-Centennial, CO",
+              "type": "metropolitan"
+            },
+            "metropolitan_division": null,
+            "place": {
+              "fips": "0877290",
+              "name": "Thornton"
+            },
+            "source": "US Census Bureau",
+            "state_fips": "08",
+            "tract_code": "009318"
+          }
+        },
+        "school_districts": {
+          "unified": {
+            "grade_high": "12",
+            "grade_low": "PK",
+            "lea_code": "0806900",
+            "name": "Adams 12 Five Star Schools"
+          }
+        }
+      },
+      "formatted_address": "W Thornton Pkwy, Denver, CO 80260",
+      "location": {
+        "lat": 39.863521,
+        "lng": -105.001565
+      },
+      "match_type": null,
+      "source": "TIGER/Line\u00ae dataset from the US Census Bureau",
+      "stable_address_key": "gcod_ussgftknnsvf2gua"
+    }
+  ]
+}

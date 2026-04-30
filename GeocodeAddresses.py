@@ -33,9 +33,6 @@ import snowflake.connector.errors as sf_errors
 from cryptography.hazmat.primitives import serialization
 from dotenv import load_dotenv
 
-# Geocodio API configuration
-GEOCODIO_API_URL = "https://api.geocod.io/v1.9/geocode"
-
 # Load environment variables from .env file
 load_dotenv()
 
@@ -55,6 +52,8 @@ SNOWFLAKE_SCHEMA = os.getenv('SNOWFLAKE_SCHEMA', 'datalake')
 
 # Geocodio API
 GEOCODIO_API_KEY = os.getenv('GEOCODIO_API_KEY')
+GEOCODIO_API_VERSION = os.getenv('GEOCODIO_API_VERSION', 'v1.12')
+GEOCODIO_API_URL = f"https://api.geocod.io/{GEOCODIO_API_VERSION}/geocode"
 
 # Infinite Campus Database (SQL Server)
 IC_DB_SERVER = os.getenv('IC_DB_SERVER', 'icampus.mapleton.us,7771')
@@ -84,6 +83,50 @@ QUERY_DISTRICTS = """
 # Module-level logger — AppLogger's configure_root_logger=True attaches
 # NDJSON handlers to the root logger, so this automatically gets structured output.
 logger = logging.getLogger(__name__)
+
+
+# One-shot flag so we don't spam 500 deprecation warnings per batch.
+_deprecation_warned = False
+
+
+def _scan_payload_for_deprecation(payload: dict) -> str | None:
+    """Return the first deprecation notice in the payload, or None.
+
+    Geocodio's canonical surface is the top-level `_warnings` array.
+    Fallback: scan top-level string values for deprecation/upgrade hints.
+    """
+    if not isinstance(payload, dict):
+        return None
+    for warning in payload.get("_warnings", []) or []:
+        if isinstance(warning, str) and (
+            "newer API version" in warning or "deprecat" in warning.lower()
+        ):
+            return warning
+    for value in payload.values():
+        if isinstance(value, str) and (
+            "deprecat" in value.lower() or "newer API version" in value
+        ):
+            return value
+    return None
+
+
+def _check_deprecation(response, payload) -> None:
+    """Log a one-shot WARNING if the response carries a deprecation signal."""
+    global _deprecation_warned
+    if _deprecation_warned:
+        return
+    notice = (
+        response.headers.get("Sunset")
+        or response.headers.get("Deprecation")
+        or _scan_payload_for_deprecation(payload)
+    )
+    if notice:
+        logger.warning(
+            "Geocodio API deprecation notice received: %s (url=%s)",
+            notice,
+            GEOCODIO_API_URL,
+        )
+        _deprecation_warned = True
 
 
 # ============================================
@@ -116,7 +159,7 @@ def validate_config() -> None:
         logger.error(error_msg)
         raise EnvironmentError(error_msg)
 
-    logger.info("Configuration validated")
+    logger.info(f"Configuration validated (Geocodio API version: {GEOCODIO_API_VERSION})")
 
 
 # ============================================
@@ -409,7 +452,9 @@ def geocode_address(address: str, api_key: str, fields: list) -> dict:
     }
     response = requests.get(GEOCODIO_API_URL, params=params, timeout=30)
     response.raise_for_status()
-    return response.json()
+    payload = response.json()
+    _check_deprecation(response, payload)
+    return payload
 
 
 def batch_geocode_addresses(addresses_df: pd.DataFrame, api_key: str) -> list:
@@ -475,6 +520,29 @@ def batch_geocode_addresses(addresses_df: pd.DataFrame, api_key: str) -> list:
     return results
 
 
+def _failed_row(addressid, addressline1, raw_response) -> dict:
+    """Canonical failed-row shape used when geocoding cannot produce coordinates.
+
+    Centralized here so changes to the parser output schema only happen in one place.
+    """
+    return {
+        'ADDRESSID': addressid,
+        'ADDRESSLINE1': addressline1,
+        'success': False,
+        'latitude': None,
+        'longitude': None,
+        'accuracy': 0.0,
+        'accuracy_type': None,
+        'source': None,
+        'block_code': None,
+        'tract_code': None,
+        'county_fips': None,
+        'lea_code': '0000',
+        'district_name': 'none',
+        'raw_response': raw_response,
+    }
+
+
 def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.DataFrame:
     """
     Parse Geocodio API results into structured DataFrame.
@@ -518,52 +586,27 @@ def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.D
             # Check if this address had an error (result is None)
             if address_result is None:
                 logger.warning(f"No results for address ID {original_addressid}")
-                parsed_rows.append({
-                    'ADDRESSID': original_addressid,
-                    'ADDRESSLINE1': original_address,
-                    'success': False,
-                    'latitude': None,
-                    'longitude': None,
-                    'accuracy': 0.0,
-                    'accuracy_type': None,
-                    'source': None,
-                    'block_code': None,
-                    'tract_code': None,
-                    'county_fips': None,
-                    'lea_code': '0000',
-                    'district_name': 'none',
-                    'raw_response': None
-                })
+                parsed_rows.append(_failed_row(original_addressid, original_address, None))
                 continue
 
             # Check if API returned no results for this address
             results_list = address_result.get('results', [])
             if len(results_list) == 0:
                 logger.warning(f"No geocoding results for address ID {original_addressid}")
-                parsed_rows.append({
-                    'ADDRESSID': original_addressid,
-                    'ADDRESSLINE1': original_address,
-                    'success': False,
-                    'latitude': None,
-                    'longitude': None,
-                    'accuracy': 0.0,
-                    'accuracy_type': None,
-                    'source': None,
-                    'block_code': None,
-                    'tract_code': None,
-                    'county_fips': None,
-                    'lea_code': '0000',
-                    'district_name': 'none',
-                    'raw_response': address_result
-                })
+                parsed_rows.append(_failed_row(original_addressid, original_address, address_result))
                 continue
 
             # Get the first (best) result
             result = results_list[0]
 
-            # Extract basic location data
-            latitude = result['location']['lat']
-            longitude = result['location']['lng']
+            # Extract basic location data — guard against missing/null location.
+            location = result.get('location') or {}
+            latitude = location.get('lat')
+            longitude = location.get('lng')
+            if latitude is None or longitude is None:
+                logger.warning(f"Missing location for address ID {original_addressid}")
+                parsed_rows.append(_failed_row(original_addressid, original_address, address_result))
+                continue
             accuracy = result.get('accuracy', 0.0)
             accuracy_type = result.get('accuracy_type')
             source = result.get('source')
@@ -916,8 +959,15 @@ def main() -> None:
                 s.rows = success_count
                 s.rows_failed = failed_count
                 if success_count > 0:
+                    successful = results_df[results_df['success']]
                     s.metadata["avg_accuracy"] = round(
-                        results_df[results_df['success']]['accuracy'].mean(), 3
+                        successful['accuracy'].mean(), 3
+                    )
+                    census_complete = successful[
+                        successful['tract_code'].notna() & successful['block_code'].notna()
+                    ]
+                    s.metadata["census_enrichment_rate"] = round(
+                        len(census_complete) / success_count, 3
                     )
 
             with log.step("enrich_districts") as s:
