@@ -86,6 +86,50 @@ QUERY_DISTRICTS = """
 logger = logging.getLogger(__name__)
 
 
+# One-shot flag so we don't spam 500 deprecation warnings per batch.
+_deprecation_warned = False
+
+
+def _scan_payload_for_deprecation(payload: dict) -> str | None:
+    """Return the first deprecation notice in the payload, or None.
+
+    Geocodio's canonical surface is the top-level `_warnings` array.
+    Fallback: scan top-level string values for deprecation/upgrade hints.
+    """
+    if not isinstance(payload, dict):
+        return None
+    for warning in payload.get("_warnings", []) or []:
+        if isinstance(warning, str) and (
+            "newer API version" in warning or "deprecat" in warning.lower()
+        ):
+            return warning
+    for value in payload.values():
+        if isinstance(value, str) and (
+            "deprecat" in value.lower() or "newer API version" in value
+        ):
+            return value
+    return None
+
+
+def _check_deprecation(response, payload) -> None:
+    """Log a one-shot WARNING if the response carries a deprecation signal."""
+    global _deprecation_warned
+    if _deprecation_warned:
+        return
+    notice = (
+        response.headers.get("Sunset")
+        or response.headers.get("Deprecation")
+        or _scan_payload_for_deprecation(payload)
+    )
+    if notice:
+        logger.warning(
+            "Geocodio API deprecation notice received: %s (url=%s)",
+            notice,
+            GEOCODIO_API_URL,
+        )
+        _deprecation_warned = True
+
+
 # ============================================
 # Configuration Validation
 # ============================================
@@ -409,7 +453,9 @@ def geocode_address(address: str, api_key: str, fields: list) -> dict:
     }
     response = requests.get(GEOCODIO_API_URL, params=params, timeout=30)
     response.raise_for_status()
-    return response.json()
+    payload = response.json()
+    _check_deprecation(response, payload)
+    return payload
 
 
 def batch_geocode_addresses(addresses_df: pd.DataFrame, api_key: str) -> list:

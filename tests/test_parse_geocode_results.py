@@ -96,3 +96,15 @@ def test_missing_location_returns_failed_row():
     assert row["latitude"] is None
     assert row["longitude"] is None
     assert row["raw_response"] == fixture
+
+
+def test_deprecation_scan_finds_warnings_entry():
+    """The scan returns the deprecation notice from _warnings; returns None for clean payloads."""
+    fixture = _load("geocodio_v19_with_deprecation.json")
+    notice = ga._scan_payload_for_deprecation(fixture)
+    assert notice is not None
+    assert "newer API version" in notice
+    assert "v1.12" in notice
+
+    clean = {"results": [], "input": {}}
+    assert ga._scan_payload_for_deprecation(clean) is None
