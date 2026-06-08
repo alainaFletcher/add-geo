@@ -1,0 +1,102 @@
+{
+    "results": [
+        {
+            "stable_address_key": "gcod_usnn9fdmcyky2paf53lbzjw2yhgwc",
+            "address_components": {
+                "number": "7350",
+                "street": "Broadway",
+                "suffix": "St",
+                "formatted_street": "Broadway St",
+                "city": "Denver",
+                "county": "Adams County",
+                "state_province": "CO",
+                "postal_code": "80221",
+                "country": "US"
+            },
+            "address_lines": [
+                "7350 Broadway St",
+                "",
+                "Denver, CO 80221"
+            ],
+            "formatted_address": "7350 Broadway St, Denver, CO 80221",
+            "location": {
+                "lat": 39.830488,
+                "lng": -104.986263
+            },
+            "accuracy": 1,
+            "accuracy_type": "rooftop",
+            "match_type": "building_centroid",
+            "source": "Adams",
+            "fields": {
+                "school_districts": {
+                    "unified": {
+                        "name": "Mapleton School District 1",
+                        "lea_code": "0805550",
+                        "grade_low": "PK",
+                        "grade_high": "12"
+                    }
+                },
+                "census": {
+                    "2025": {
+                        "census_year": 2025,
+                        "state_fips": "08",
+                        "county_fips": "08001",
+                        "tract_code": "009307",
+                        "block_code": "2018",
+                        "block_group": "2",
+                        "full_fips": "080010093072018",
+                        "place": {
+                            "name": "Sherrelwood",
+                            "fips": "0869810"
+                        },
+                        "metro_micro_statistical_area": {
+                            "name": "Denver-Aurora-Centennial, CO",
+                            "area_code": "19740",
+                            "type": "metropolitan"
+                        },
+                        "combined_statistical_area": {
+                            "name": "Denver-Aurora-Greeley, CO",
+                            "area_code": "216"
+                        },
+                        "metropolitan_division": null,
+                        "county_subdivision": {
+                            "name": "West Adams",
+                            "fips": "93800",
+                            "fips_class": {
+                                "class_code": "Z5",
+                                "description": "A statistical county subdivision"
+                            }
+                        },
+                        "source": "US Census Bureau"
+                    }
+                },
+                "zip4": {
+                    "record_type": {
+                        "code": "F",
+                        "description": "Firm"
+                    },
+                    "residential": false,
+                    "carrier_route": {
+                        "id": "C015",
+                        "description": "City Delivery"
+                    },
+                    "building_or_firm_name": "Denver Institute Of Tech",
+                    "plus4": [
+                        "3653"
+                    ],
+                    "zip9": [
+                        "80221-3653"
+                    ],
+                    "government_building": null,
+                    "facility_code": {
+                        "code": "P",
+                        "description": "Post Office"
+                    },
+                    "city_delivery": true,
+                    "valid_delivery_area": true,
+                    "exact_match": false
+                }
+            }
+        }
+    ]
+}

@@ -54,21 +54,21 @@ def _addresses_df():
 
 
 def test_success_extracts_all_fields():
-    """Parser extracts location, accuracy, census, and school district from a real v1.9 response."""
-    fixture = _load("geocodio_v19_with_deprecation.json")
+    """Parser extracts location, accuracy, census2025, and school district from a real v2 response."""
+    fixture = _load("geocodio_v2_with_census2025.json")
     df = ga.parse_geocode_results([fixture], _addresses_df())
     assert len(df) == 1
     row = df.iloc[0]
     assert row["success"]
-    assert row["latitude"] == 39.870709
-    assert row["longitude"] == -104.968308
-    assert row["accuracy"] == 0.59
-    assert row["accuracy_type"] == "street_center"
-    assert row["block_code"] == "2013"
-    assert row["tract_code"] == "009204"
+    assert row["latitude"] == 39.830488
+    assert row["longitude"] == -104.986263
+    assert row["accuracy"] == 1
+    assert row["accuracy_type"] == "rooftop"
+    assert row["block_code"] == "2018"
+    assert row["tract_code"] == "009307"
     assert row["county_fips"] == "08001"
-    assert row["lea_code"] == "0806900"
-    assert row["district_name"] == "Adams 12 Five Star Schools"
+    assert row["lea_code"] == "0805550"
+    assert row["district_name"] == "Mapleton School District 1"
     assert row["raw_response"] == fixture
 
 

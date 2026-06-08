@@ -52,7 +52,7 @@ SNOWFLAKE_SCHEMA = os.getenv('SNOWFLAKE_SCHEMA', 'datalake')
 
 # Geocodio API
 GEOCODIO_API_KEY = os.getenv('GEOCODIO_API_KEY')
-GEOCODIO_API_VERSION = os.getenv('GEOCODIO_API_VERSION', 'v1.12')
+GEOCODIO_API_VERSION = os.getenv('GEOCODIO_API_VERSION', 'v2')
 GEOCODIO_API_URL = f"https://api.geocod.io/{GEOCODIO_API_VERSION}/geocode"
 
 # Infinite Campus Database (SQL Server)
@@ -65,7 +65,7 @@ IC_DB_DRIVER = os.getenv('IC_DB_DRIVER', 'ODBC Driver 18 for SQL Server')
 # Application Settings
 BATCH_SIZE = int(os.getenv('BATCH_SIZE', '500'))
 ACCURACY_THRESHOLD = float(os.getenv('ACCURACY_THRESHOLD', '0.8'))
-API_FIELDS = ["school", "zip4", "census2024"]
+API_FIELDS = ["school", "zip4", "census2025"]
 
 # SQL Queries
 QUERY_ADDRESSES = """
@@ -437,7 +437,7 @@ def geocode_address(address: str, api_key: str, fields: list) -> dict:
     Args:
         address: The address string to geocode
         api_key: Geocod.io API key
-        fields: List of additional fields to request (e.g., ["school", "census2024"])
+        fields: List of additional fields to request (e.g., ["school", "census2025"])
 
     Returns:
         dict: API response containing geocoding results
@@ -613,7 +613,6 @@ def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.D
 
             fields = result.get('fields', {})
 
-            # Extract census data (2024) and school district data
             # Note: fields might be empty if not requested or not available with API key
             block_code = None
             tract_code = None
@@ -622,14 +621,14 @@ def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.D
             district_name = 'none'
 
             if fields:
-                # Extract census data (2024)
-                # API returns nested structure: fields.census.2024
+                # Extract census data (2025)
+                # API returns nested structure: fields.census.2025
                 census_data = fields.get('census', {})
-                if census_data and '2024' in census_data:
-                    census_2024 = census_data['2024']
-                    block_code = census_2024.get('block_code')
-                    tract_code = census_2024.get('tract_code')
-                    county_fips = census_2024.get('county_fips')
+                if census_data and '2025' in census_data:
+                    census_2025 = census_data['2025']
+                    block_code = census_2025.get('block_code')
+                    tract_code = census_2025.get('tract_code')
+                    county_fips = census_2025.get('county_fips')
 
                 # Extract school district data
                 school_districts = fields.get('school_districts', {})
