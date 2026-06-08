@@ -52,7 +52,7 @@ SNOWFLAKE_SCHEMA = os.getenv('SNOWFLAKE_SCHEMA', 'datalake')
 
 # Geocodio API
 GEOCODIO_API_KEY = os.getenv('GEOCODIO_API_KEY')
-GEOCODIO_API_VERSION = os.getenv('GEOCODIO_API_VERSION', 'v1.12')
+GEOCODIO_API_VERSION = os.getenv('GEOCODIO_API_VERSION', 'v2')
 GEOCODIO_API_URL = f"https://api.geocod.io/{GEOCODIO_API_VERSION}/geocode"
 
 # Infinite Campus Database (SQL Server)
