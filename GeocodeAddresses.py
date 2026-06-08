@@ -437,7 +437,7 @@ def geocode_address(address: str, api_key: str, fields: list) -> dict:
     Args:
         address: The address string to geocode
         api_key: Geocod.io API key
-        fields: List of additional fields to request (e.g., ["school", "census2024"])
+        fields: List of additional fields to request (e.g., ["school", "census2025"])
 
     Returns:
         dict: API response containing geocoding results
@@ -613,7 +613,6 @@ def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.D
 
             fields = result.get('fields', {})
 
-            # Extract census data (2024) and school district data
             # Note: fields might be empty if not requested or not available with API key
             block_code = None
             tract_code = None
