@@ -65,7 +65,7 @@ IC_DB_DRIVER = os.getenv('IC_DB_DRIVER', 'ODBC Driver 18 for SQL Server')
 # Application Settings
 BATCH_SIZE = int(os.getenv('BATCH_SIZE', '500'))
 ACCURACY_THRESHOLD = float(os.getenv('ACCURACY_THRESHOLD', '0.8'))
-API_FIELDS = ["school", "zip4", "census2024"]
+API_FIELDS = ["school", "zip4", "census2025"]
 
 # SQL Queries
 QUERY_ADDRESSES = """
@@ -622,14 +622,14 @@ def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.D
             district_name = 'none'
 
             if fields:
-                # Extract census data (2024)
-                # API returns nested structure: fields.census.2024
+                # Extract census data (2025)
+                # API returns nested structure: fields.census.2025
                 census_data = fields.get('census', {})
-                if census_data and '2024' in census_data:
-                    census_2024 = census_data['2024']
-                    block_code = census_2024.get('block_code')
-                    tract_code = census_2024.get('tract_code')
-                    county_fips = census_2024.get('county_fips')
+                if census_data and '2025' in census_data:
+                    census_2025 = census_data['2025']
+                    block_code = census_2025.get('block_code')
+                    tract_code = census_2025.get('tract_code')
+                    county_fips = census_2025.get('county_fips')
 
                 # Extract school district data
                 school_districts = fields.get('school_districts', {})
