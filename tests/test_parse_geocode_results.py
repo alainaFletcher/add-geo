@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Set required env vars so module-level config validation passes on import.
+# conftest.py already sets fake env vars before import; these are redundant fallbacks.
 os.environ.setdefault("SNOWFLAKE_USER", "test")
 os.environ.setdefault("SNOWFLAKE_PRIVATE_KEY_B64", "test")
 os.environ.setdefault("GEOCODIO_API_KEY", "test")
@@ -108,3 +108,25 @@ def test_deprecation_scan_finds_warnings_entry():
 
     clean = {"results": [], "input": {}}
     assert ga._scan_payload_for_deprecation(clean) is None
+
+
+def test_null_census_block_is_a_success_without_census():
+    """census: {"2025": null} is a valid geocode with no census append, not a crash."""
+    fixture = _load("geocodio_v2_with_census2025.json")
+    fixture["results"][0]["fields"]["census"]["2025"] = None
+    row = ga.parse_geocode_results([fixture], _addresses_df()).iloc[0]
+    assert row["success"]
+    assert row["tract_code"] is None
+    assert row["lea_code"] == "0805550"
+
+
+def test_malformed_response_fails_only_its_own_row():
+    """One unexpected payload shape must not discard the rest of the (paid-for) batch."""
+    good = _load("geocodio_v2_with_census2025.json")
+    addresses = pd.DataFrame([
+        {"ADDRESSID": 1, "ADDRESSLINE1": "1 Bad Payload St"},
+        {"ADDRESSID": 2, "ADDRESSLINE1": "13515 Thornton Pkwy"},
+    ])
+    df = ga.parse_geocode_results([{"results": "not-a-list"}, good], addresses)
+    assert list(df["success"]) == [False, True]
+    assert df.iloc[1]["lea_code"] == "0805550"

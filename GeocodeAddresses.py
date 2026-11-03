@@ -2,10 +2,10 @@
 """
 Address Geocoding Application
 
-This application geocodes addresses from Infinite Campus
-using the Geocodio API. It looks up addresses individually, enriches them with
-census and school district data, and updates both Infinite Campus and Snowflake
-databases.
+This daily job reads addresses needing geocoding from a Snowflake view over
+Infinite Campus data, looks each one up with the Geocodio API (with census and
+school district appends), stores every raw response in a Snowflake audit table,
+and writes house-level matches back to the Infinite Campus ADDRESS table.
 """
 
 import os
@@ -66,6 +66,12 @@ IC_DB_DRIVER = os.getenv('IC_DB_DRIVER', 'ODBC Driver 18 for SQL Server')
 # Application Settings
 BATCH_SIZE = int(os.getenv('BATCH_SIZE', '500'))
 ACCURACY_THRESHOLD = float(os.getenv('ACCURACY_THRESHOLD', '0.8'))
+# Geocodio accuracy_types that place the address at a house (Geocodio docs,
+# best-first). intersection/street_center put it on a street; place, county,
+# and state mean the address was not found. Only these are written to IC.
+HOUSE_LEVEL_ACCURACY_TYPES = frozenset({
+    "rooftop", "point", "range_interpolation", "nearest_rooftop_match",
+})
 API_FIELDS = ["school", "zip4", "census2025"]
 
 # Geocodio statuses that doom every later call in the batch: 403 = invalid key
@@ -447,7 +453,15 @@ def fetch_district_lookup(snowflake_conn: SnowflakeConnection) -> pd.DataFrame:
 
         # Convert NCESDISTRICTID to numeric and set as index
         df['NCESDISTRICTID'] = pd.to_numeric(df['NCESDISTRICTID'], errors='coerce').astype('Int64')
-        df.set_index('NCESDISTRICTID', inplace=True)
+        df = df.drop_duplicates()
+        # An NCES ID mapped to more than one IC district is ambiguous: leave
+        # those addresses unmatched rather than guess (or crash the lookup).
+        nces_ids = df['NCESDISTRICTID'].dropna()
+        conflicting = sorted(int(i) for i in nces_ids[nces_ids.duplicated()].unique())
+        if conflicting:
+            logger.warning(f"Ignoring NCES district IDs mapped to more than one IC district: {conflicting}")
+            df = df[~df['NCESDISTRICTID'].isin(conflicting)]
+        df = df.set_index('NCESDISTRICTID')
 
         logger.info(f"Successfully fetched {len(df)} district mappings")
 
@@ -527,8 +541,9 @@ def batch_geocode_addresses(addresses_df: pd.DataFrame, api_key: str) -> list:
     """
     Geocode addresses individually using single API calls.
 
-    Processes each address one at a time with individual API calls.
-    This approach works with API keys that don't support batch operations.
+    Processes each address one at a time with individual API calls. (Geocodio's
+    batch endpoint would also work, but at this job's daily volume it gains little
+    and would make the per-address failure handling below coarser.)
 
     Args:
         addresses_df: DataFrame with ADDRESSID and ADDRESSLINE1 columns
@@ -637,6 +652,54 @@ def _failed_row(addressid, addressline1, raw_response) -> dict:
     }
 
 
+def _parse_result(address_result, addressid, address) -> dict:
+    """Parse one Geocodio response into a results row (success or failed shape)."""
+    # Check if this address had an error (result is None)
+    if address_result is None:
+        logger.warning(f"No results for address ID {addressid}")
+        return _failed_row(addressid, address, None)
+
+    # Check if API returned no results for this address
+    results_list = address_result.get('results') or []
+    if len(results_list) == 0:
+        logger.warning(f"No geocoding results for address ID {addressid}")
+        return _failed_row(addressid, address, address_result)
+
+    # Get the first (best) result
+    result = results_list[0]
+
+    # Extract basic location data — guard against missing/null location.
+    location = result.get('location') or {}
+    latitude = location.get('lat')
+    longitude = location.get('lng')
+    if latitude is None or longitude is None:
+        logger.warning(f"Missing location for address ID {addressid}")
+        return _failed_row(addressid, address, address_result)
+
+    # Appends may be absent or null (field not available for this address);
+    # that is a geocode without census/district data, not a failure.
+    fields = result.get('fields') or {}
+    census_2025 = (fields.get('census') or {}).get('2025') or {}
+    unified = (fields.get('school_districts') or {}).get('unified') or {}
+
+    return {
+        'ADDRESSID': addressid,
+        'ADDRESSLINE1': address,
+        'success': True,
+        'latitude': latitude,
+        'longitude': longitude,
+        'accuracy': result.get('accuracy', 0.0),
+        'accuracy_type': result.get('accuracy_type'),
+        'source': result.get('source'),
+        'block_code': census_2025.get('block_code'),
+        'tract_code': census_2025.get('tract_code'),
+        'county_fips': census_2025.get('county_fips'),
+        'lea_code': unified.get('lea_code', '0000'),
+        'district_name': unified.get('name', 'none'),
+        'raw_response': address_result,
+    }
+
+
 def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.DataFrame:
     """
     Parse Geocodio API results into structured DataFrame.
@@ -672,83 +735,15 @@ def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.D
 
         # Process each individual API response
         for idx, address_result in enumerate(api_results):
-
-            # Get original address info
             original_addressid = addresses_df.iloc[idx]['ADDRESSID']
             original_address = addresses_df.iloc[idx]['ADDRESSLINE1']
-
-            # Check if this address had an error (result is None)
-            if address_result is None:
-                logger.warning(f"No results for address ID {original_addressid}")
-                parsed_rows.append(_failed_row(original_addressid, original_address, None))
-                continue
-
-            # Check if API returned no results for this address
-            results_list = address_result.get('results', [])
-            if len(results_list) == 0:
-                logger.warning(f"No geocoding results for address ID {original_addressid}")
+            try:
+                parsed_rows.append(_parse_result(address_result, original_addressid, original_address))
+            except Exception as e:
+                # An unexpected payload shape fails only its own row; the rest
+                # of the batch (already paid for) is still written.
+                logger.warning(f"Unparseable Geocodio response for address ID {original_addressid}: {type(e).__name__}")
                 parsed_rows.append(_failed_row(original_addressid, original_address, address_result))
-                continue
-
-            # Get the first (best) result
-            result = results_list[0]
-
-            # Extract basic location data — guard against missing/null location.
-            location = result.get('location') or {}
-            latitude = location.get('lat')
-            longitude = location.get('lng')
-            if latitude is None or longitude is None:
-                logger.warning(f"Missing location for address ID {original_addressid}")
-                parsed_rows.append(_failed_row(original_addressid, original_address, address_result))
-                continue
-            accuracy = result.get('accuracy', 0.0)
-            accuracy_type = result.get('accuracy_type')
-            source = result.get('source')
-
-            fields = result.get('fields', {})
-
-            # Note: fields might be empty if not requested or not available with API key
-            block_code = None
-            tract_code = None
-            county_fips = None
-            lea_code = '0000'
-            district_name = 'none'
-
-            if fields:
-                # Extract census data (2025)
-                # API returns nested structure: fields.census.2025
-                census_data = fields.get('census', {})
-                if census_data and '2025' in census_data:
-                    census_2025 = census_data['2025']
-                    block_code = census_2025.get('block_code')
-                    tract_code = census_2025.get('tract_code')
-                    county_fips = census_2025.get('county_fips')
-
-                # Extract school district data
-                school_districts = fields.get('school_districts', {})
-                if school_districts:
-                    unified = school_districts.get('unified')
-                    if unified:
-                        lea_code = unified.get('lea_code', '0000')
-                        district_name = unified.get('name', 'none')
-
-            # Add parsed result
-            parsed_rows.append({
-                'ADDRESSID': original_addressid,
-                'ADDRESSLINE1': original_address,
-                'success': True,
-                'latitude': latitude,
-                'longitude': longitude,
-                'accuracy': accuracy,
-                'accuracy_type': accuracy_type,
-                'source': source,
-                'block_code': block_code,
-                'tract_code': tract_code,
-                'county_fips': county_fips,
-                'lea_code': lea_code,
-                'district_name': district_name,
-                'raw_response': address_result
-            })
 
         # Convert to DataFrame
         results_df = pd.DataFrame(parsed_rows)
@@ -799,6 +794,12 @@ def enrich_with_district_ids(results_df: pd.DataFrame, districts_df: pd.DataFram
                 nces_id = int(lea_code)
             except (ValueError, TypeError):
                 logger.warning(f"Invalid LEA code for address ID {results_df.at[idx, 'ADDRESSID']}: '{lea_code}'")
+                continue
+
+            # '0000' is the parser's "no unified school district returned" default,
+            # not an NCES ID; never let it match a placeholder district row.
+            if nces_id == 0:
+                logger.warning(f"No school district returned for address ID {results_df.at[idx, 'ADDRESSID']}")
                 continue
 
             # Look up district ID
@@ -907,9 +908,10 @@ def update_ic_addresses(results_df: pd.DataFrame, ic_conn: pyodbc.Connection,
     """
     Update Infinite Campus ADDRESS table with geocoded data.
 
-    Only updates addresses that meet the accuracy threshold.
-    Updates latitude, longitude, tract, block, location_code (county FIPS),
-    and optionally districtID if a match was found.
+    Only writes results with accuracy >= the threshold and a house-level
+    accuracy_type (HOUSE_LEVEL_ACCURACY_TYPES). Sets latitude, longitude,
+    tract, block, location_code (county FIPS), and districtID, writing NULL for
+    any missing census value or unmatched district.
 
     Args:
         results_df: DataFrame with geocoding results
@@ -939,39 +941,46 @@ def update_ic_addresses(results_df: pd.DataFrame, ic_conn: pyodbc.Connection,
                 skipped_count += 1
                 continue
 
-            # Skip results below accuracy threshold
-            accuracy = row.get('accuracy', 0.0)
-            if accuracy < accuracy_threshold:
+            # Skip results below accuracy threshold. `not >=` also skips a
+            # missing (NaN/None) score, which a `<` comparison would let through.
+            accuracy = row.get('accuracy')
+            if not (pd.notna(accuracy) and accuracy >= accuracy_threshold):
                 logger.debug(f"Skipping address ID {address_id}: accuracy {accuracy} below threshold {accuracy_threshold}")
                 skipped_count += 1
                 continue
 
-            # Extract values for update
+            # A high score alone isn't enough: only house-level matches are written.
+            accuracy_type = row.get('accuracy_type')
+            if accuracy_type not in HOUSE_LEVEL_ACCURACY_TYPES:
+                logger.debug(f"Skipping address ID {address_id}: accuracy type {accuracy_type} is not house-level")
+                skipped_count += 1
+                continue
+
+            # These fields are job-owned (no end-user edits), so write exactly
+            # what this geocode says. A census or district value left over from
+            # a previous location would be wrong, so missing values are written
+            # as NULL rather than kept.
             latitude = row.get('latitude')
             longitude = row.get('longitude')
             tract_code = row.get('tract_code')
             block_code = row.get('block_code')
             county_fips = row.get('county_fips')
             district_id = row.get('DISTRICTID', 0)
+            district_id = None if pd.isna(district_id) or district_id == 0 else int(district_id)
+
+            if any(pd.isna(value) for value in (tract_code, block_code, county_fips)):
+                logger.warning(
+                    f"Incomplete census data for address ID {address_id}; "
+                    f"writing blanks for missing tract/block/location_code"
+                )
 
             try:
-                # Use different SQL based on whether we have a valid district ID
-                if district_id == 0 or pd.isna(district_id):
-                    # Update without district ID
-                    sql_update = """
-                        UPDATE ADDRESS
-                        SET latitude = ?, longitude = ?, tract = ?, block = ?, location_code = ?
-                        WHERE addressid = ?
-                    """
-                    args = (latitude, longitude, tract_code, block_code, county_fips, address_id)
-                else:
-                    # Update with district ID
-                    sql_update = """
-                        UPDATE ADDRESS
-                        SET latitude = ?, longitude = ?, tract = ?, block = ?, location_code = ?, districtID = ?
-                        WHERE addressid = ?
-                    """
-                    args = (latitude, longitude, tract_code, block_code, county_fips, int(district_id), address_id)
+                sql_update = """
+                    UPDATE ADDRESS
+                    SET latitude = ?, longitude = ?, tract = ?, block = ?, location_code = ?, districtID = ?
+                    WHERE addressid = ?
+                """
+                args = (latitude, longitude, tract_code, block_code, county_fips, district_id, address_id)
 
                 cursor.execute(sql_update, args)
                 cursor.commit()
