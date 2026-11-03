@@ -9,6 +9,7 @@ databases.
 """
 
 import os
+import re
 import sys
 import logging
 import time
@@ -52,7 +53,7 @@ SNOWFLAKE_SCHEMA = os.getenv('SNOWFLAKE_SCHEMA', 'datalake')
 
 # Geocodio API
 GEOCODIO_API_KEY = os.getenv('GEOCODIO_API_KEY')
-GEOCODIO_API_VERSION = os.getenv('GEOCODIO_API_VERSION', 'v2')
+GEOCODIO_API_VERSION = os.getenv('GEOCODIO_API_VERSION', 'v2.1')
 GEOCODIO_API_URL = f"https://api.geocod.io/{GEOCODIO_API_VERSION}/geocode"
 
 # Infinite Campus Database (SQL Server)
@@ -66,6 +67,12 @@ IC_DB_DRIVER = os.getenv('IC_DB_DRIVER', 'ODBC Driver 18 for SQL Server')
 BATCH_SIZE = int(os.getenv('BATCH_SIZE', '500'))
 ACCURACY_THRESHOLD = float(os.getenv('ACCURACY_THRESHOLD', '0.8'))
 API_FIELDS = ["school", "zip4", "census2025"]
+
+# Geocodio statuses that doom every later call in the batch: 403 = invalid key
+# or daily quota exhausted (per Geocodio docs), 429 = pay-as-you-go rate limit.
+GEOCODIO_FATAL_STATUSES = frozenset({401, 403, 429})
+# Stop calling Geocodio after this many failures in a row (outage, network).
+MAX_CONSECUTIVE_GEOCODE_FAILURES = 5
 
 # SQL Queries
 QUERY_ADDRESSES = """
@@ -127,6 +134,20 @@ def _check_deprecation(response, payload) -> None:
             GEOCODIO_API_URL,
         )
         _deprecation_warned = True
+
+
+def _describe_db_error(exc: Exception) -> str:
+    """Summarize a driver exception without its message text.
+
+    Driver messages can carry logins (pyodbc "Login failed for user ...") or
+    bound row data such as addresses, so keep only the type and error codes.
+    """
+    if isinstance(exc, sf_errors.Error):
+        return f"{type(exc).__name__} (errno {exc.errno}, sqlstate {exc.sqlstate})"
+    if isinstance(exc, pyodbc.Error) and len(exc.args) > 1 \
+            and re.fullmatch(r"[0-9A-Z]{5}", str(exc.args[0])):
+        return f"{type(exc).__name__} (SQLSTATE {exc.args[0]})"
+    return type(exc).__name__
 
 
 # ============================================
@@ -264,20 +285,25 @@ def create_snowflake_connection(database: str = SNOWFLAKE_DATABASE,
             return conn
 
         except sf_errors.ProgrammingError as e:
-            logger.warning(f"Connection attempt {attempt} failed: {e}")
+            logger.warning(f"Connection attempt {attempt} failed: {_describe_db_error(e)}")
 
             if attempt == max_retries:
                 logger.error("Failed to connect to Snowflake after all retries")
                 logger.error("Please check credentials and network connectivity")
-                raise
+                # from None: the chained driver error's text may name the user.
+                raise ConnectionError(
+                    f"Snowflake connection failed: {_describe_db_error(e)}"
+                ) from None
 
             logger.info(f"Retrying in {retry_delay} seconds...")
             time.sleep(retry_delay)
             retry_delay *= 2  # Exponential backoff
 
         except Exception as e:
-            logger.error(f"Unexpected error connecting to Snowflake: {e}")
-            raise
+            logger.error(f"Unexpected error connecting to Snowflake: {_describe_db_error(e)}")
+            raise ConnectionError(
+                f"Snowflake connection failed: {_describe_db_error(e)}"
+            ) from None
 
 
 def create_ic_connection() -> pyodbc.Connection:
@@ -314,20 +340,25 @@ def create_ic_connection() -> pyodbc.Connection:
             return conn
 
         except pyodbc.Error as e:
-            logger.warning(f"IC connection attempt {attempt} failed: {e}")
+            logger.warning(f"IC connection attempt {attempt} failed: {_describe_db_error(e)}")
 
             if attempt == max_retries:
                 logger.error("Failed to connect to Infinite Campus after all retries")
                 logger.error("Please check credentials and network connectivity")
-                raise
+                # from None: pyodbc's "Login failed for user '...'" must not chain in.
+                raise ConnectionError(
+                    f"Infinite Campus connection failed: {_describe_db_error(e)}"
+                ) from None
 
             logger.info(f"Retrying in {retry_delay} seconds...")
             time.sleep(retry_delay)
             retry_delay *= 2  # Exponential backoff
 
         except Exception as e:
-            logger.error(f"Unexpected error connecting to Infinite Campus: {e}")
-            raise
+            logger.error(f"Unexpected error connecting to Infinite Campus: {_describe_db_error(e)}")
+            raise ConnectionError(
+                f"Infinite Campus connection failed: {_describe_db_error(e)}"
+            ) from None
 
 
 # ============================================
@@ -379,13 +410,14 @@ def fetch_addresses_to_geocode(snowflake_conn: SnowflakeConnection,
         return df
 
     except sf_errors.ProgrammingError as e:
-        logger.error(f"Snowflake query error: {e}")
+        logger.error(f"Snowflake query error: {_describe_db_error(e)}")
         logger.error("Please check the view name and permissions")
-        raise
+        # from None: runtime conversion errors (e.g. errno 100038) echo row values.
+        raise RuntimeError(f"Snowflake address fetch failed: {_describe_db_error(e)}") from None
 
     except Exception as e:
-        logger.error(f"Error fetching addresses from Snowflake: {e}")
-        raise
+        logger.error(f"Error fetching addresses from Snowflake: {_describe_db_error(e)}")
+        raise RuntimeError(f"Snowflake address fetch failed: {_describe_db_error(e)}") from None
 
 
 def fetch_district_lookup(snowflake_conn: SnowflakeConnection) -> pd.DataFrame:
@@ -422,21 +454,56 @@ def fetch_district_lookup(snowflake_conn: SnowflakeConnection) -> pd.DataFrame:
         return df
 
     except Exception as e:
-        logger.error(f"Error fetching district lookup: {e}")
-        raise
+        logger.error(f"Error fetching district lookup: {_describe_db_error(e)}")
+        raise RuntimeError(f"Snowflake district fetch failed: {_describe_db_error(e)}") from None
 
 
 # ============================================
 # Geocoding Functions
 # ============================================
 
-def geocode_address(address: str, api_key: str, fields: list) -> dict:
+class GeocodioFatalError(RuntimeError):
+    """Geocodio failed in a way that dooms the rest of the batch.
+
+    The message carries only an HTTP status or exception type -- never the
+    request URL, whose q= parameter is a student address.
+
+    ``results`` has one entry per input address (None where not geocoded) so
+    the caller can still save lookups that succeeded, and were paid for,
+    before the abort.
     """
-    Call Geocod.io API directly to geocode a single address.
+
+    def __init__(self, message: str, results: list | None = None):
+        super().__init__(message)
+        self.results = results if results is not None else []
+
+
+def create_geocodio_session(api_key: str) -> requests.Session:
+    """
+    Create a requests session that authenticates to Geocodio by header.
+
+    Sending the key as ``Authorization: Bearer`` rather than the ``api_key``
+    query parameter keeps it out of request URLs, which requests embeds in
+    exception messages.
+
+    Also raises urllib3's log level to ERROR: its WARNINGs (e.g. "Failed to
+    parse headers (url=...)") include the full query string, and app_logger
+    only lowers urllib3 to WARNING. urllib3 logs nothing at ERROR or above.
+    """
+    for name in ("urllib3", "urllib3.connectionpool"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+    session = requests.Session()
+    session.headers["Authorization"] = f"Bearer {api_key}"
+    return session
+
+
+def geocode_address(session: requests.Session, address: str, fields: list) -> dict:
+    """
+    Call Geocodio API directly to geocode a single address.
 
     Args:
+        session: Session from create_geocodio_session() (carries the API key)
         address: The address string to geocode
-        api_key: Geocod.io API key
         fields: List of additional fields to request (e.g., ["school", "census2025"])
 
     Returns:
@@ -447,10 +514,9 @@ def geocode_address(address: str, api_key: str, fields: list) -> dict:
     """
     params = {
         "q": address,
-        "api_key": api_key,
         "fields": ",".join(fields)
     }
-    response = requests.get(GEOCODIO_API_URL, params=params, timeout=30)
+    response = session.get(GEOCODIO_API_URL, params=params, timeout=30)
     response.raise_for_status()
     payload = response.json()
     _check_deprecation(response, payload)
@@ -472,48 +538,76 @@ def batch_geocode_addresses(addresses_df: pd.DataFrame, api_key: str) -> list:
         list: List of API responses (dicts), one per address (in same order as input)
 
     Raises:
-        requests.exceptions.HTTPError: If API returns 401 (authentication error)
+        GeocodioFatalError: On 401/403/429 (bad key, quota, rate limit), after
+            MAX_CONSECUTIVE_GEOCODE_FAILURES non-422 failures in a row, or when
+            no lookup succeeded and at least one failed for a non-422 reason.
+            Its ``results`` holds the lookups completed before the abort.
     """
     logger.info(f"Geocoding {len(addresses_df)} addresses individually...")
 
     results = []
     success_count = 0
     error_count = 0
+    consecutive_failures = 0
+    last_failure = None  # most recent non-422 failure
 
-    for idx, row in addresses_df.iterrows():
-        address = row['ADDRESSLINE1']
-        address_id = row['ADDRESSID']
+    def _abort(message: str) -> GeocodioFatalError:
+        # Pad to one entry per address so earlier lookups can still be saved.
+        padded = results + [None] * (len(addresses_df) - len(results))
+        return GeocodioFatalError(message, results=padded)
 
-        try:
-            response = geocode_address(address, api_key, API_FIELDS)
-            results.append(response)
-            success_count += 1
+    with create_geocodio_session(api_key) as session:
+        for idx, row in addresses_df.iterrows():
+            address_id = row['ADDRESSID']
+            address = row['ADDRESSLINE1']  # outside try: a schema error isn't a Geocodio failure
+            status = None
 
-            if (idx + 1) % 50 == 0:
-                logger.info(f"Geocoding progress: {success_count} succeeded, {error_count} failed of {idx + 1} processed")
-
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                logger.error("Geocodio API authentication failed")
-                raise
-            elif e.response.status_code == 422:
-                logger.warning(f"Invalid geocoding request for address ID {address_id}")
-                results.append(None)
-                error_count += 1
+            # Keep only the status code or type name from exceptions: requests
+            # embeds the full URL, including the q= address, in its messages.
+            # GeocodioFatalError is raised after the except blocks so the
+            # original exception is never chained onto it.
+            try:
+                response = geocode_address(session, address, API_FIELDS)
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code
+                failure = f"HTTP {status}"
+            except Exception as e:
+                failure = type(e).__name__
             else:
-                logger.warning(f"HTTP error geocoding address ID {address_id}: status {e.response.status_code}")
-                results.append(None)
-                error_count += 1
+                results.append(response)
+                success_count += 1
+                consecutive_failures = 0
+                if (idx + 1) % 50 == 0:
+                    logger.info(f"Geocoding progress: {success_count} succeeded, {error_count} failed of {idx + 1} processed")
+                continue
 
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Request error geocoding address ID {address_id}: {type(e).__name__}")
+            if status in GEOCODIO_FATAL_STATUSES:
+                logger.error(f"Geocodio rejected the request ({failure}): invalid key, quota exhausted, or rate limited")
+                raise _abort(f"Geocodio rejected the request ({failure})")
+
             results.append(None)
             error_count += 1
 
-        except Exception as e:
-            logger.warning(f"Error geocoding address ID {address_id}: {type(e).__name__}")
-            results.append(None)
-            error_count += 1
+            if status == 422:
+                # This one address is unparseable. Neutral for the breaker: it
+                # neither proves Geocodio healthy nor counts as an outage.
+                logger.warning(f"Invalid geocoding request for address ID {address_id}")
+                continue
+
+            logger.warning(f"Geocoding failed for address ID {address_id}: {failure}")
+            last_failure = failure
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_GEOCODE_FAILURES:
+                logger.error(f"Aborting geocoding after {consecutive_failures} consecutive failures")
+                raise _abort(
+                    f"{consecutive_failures} consecutive Geocodio failures (last: {failure})"
+                )
+
+    # Small batches can't reach the streak limit; zero successes with any
+    # non-422 failure still means Geocodio was unusable this run.
+    if success_count == 0 and last_failure is not None:
+        logger.error("No successful Geocodio lookups this run")
+        raise _abort(f"No successful Geocodio lookups ({error_count} failed, last: {last_failure})")
 
     logger.info(f"Geocoding complete: {success_count} successful, {error_count} failed")
 
@@ -783,14 +877,19 @@ def log_results_to_snowflake(results_df: pd.DataFrame, snowflake_conn: Snowflake
                 if (success_count + error_count) % 100 == 0:
                     logger.info(f"Snowflake logging progress: {success_count + error_count}/{len(results_df)}")
 
+            # Codes only: the connector inlines bound parameters into the SQL,
+            # so error text can echo the raw response (address, coordinates).
             except sf_errors.ProgrammingError as e:
-                logger.warning(f"Failed to log address ID {address_id} to Snowflake: {e}")
-                logger.debug(f"Error details - errno: {e.errno}, sqlstate: {e.sqlstate}, msg: {e.msg}")
+                logger.warning(f"Failed to log address ID {address_id} to Snowflake: {_describe_db_error(e)}")
                 error_count += 1
 
             except Exception as e:
-                logger.warning(f"Unexpected error logging address ID {address_id}: {e}")
+                logger.warning(f"Unexpected error logging address ID {address_id}: {_describe_db_error(e)}")
                 error_count += 1
+
+        # No-op under Snowflake's default AUTOCOMMIT; keeps the audit rows if
+        # it is off. Done here so a failure stays inside this non-fatal step.
+        snowflake_conn.commit()
 
         logger.info(f"Snowflake logging complete: {success_count} successful, {error_count} failed")
         return success_count, error_count
@@ -882,11 +981,11 @@ def update_ic_addresses(results_df: pd.DataFrame, ic_conn: pyodbc.Connection,
                     logger.info(f"IC update progress: {success_count} addresses updated...")
 
             except pyodbc.Error as e:
-                logger.warning(f"Failed to update address ID {address_id} in IC: {type(e).__name__}")
+                logger.warning(f"Failed to update address ID {address_id} in IC: {_describe_db_error(e)}")
                 error_count += 1
 
             except Exception as e:
-                logger.warning(f"Unexpected error updating address ID {address_id}: {e}")
+                logger.warning(f"Unexpected error updating address ID {address_id}: {_describe_db_error(e)}")
                 error_count += 1
 
         logger.info(f"IC update complete: {success_count} updated, {error_count} errors, {skipped_count} skipped")
@@ -900,12 +999,114 @@ def update_ic_addresses(results_df: pd.DataFrame, ic_conn: pyodbc.Connection,
 # Main Execution
 # ============================================
 
+def _close_quietly(conn, name: str) -> None:
+    """Close a connection at teardown; failing to close must not fail a finished run."""
+    try:
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Error closing {name} connection: {_describe_db_error(e)}")
+
+
+def run_pipeline(log: AppLogger) -> None:
+    """
+    Run the geocoding steps under AppLogger step tracking.
+
+    Exceptions from fatal steps propagate to main(), which records the run as
+    FAILED. log.step() has already logged them (sanitized) by then.
+    """
+    with log.step("validate_config") as s:
+        validate_config()
+        if not GEOCODIO_API_KEY:
+            raise EnvironmentError("GEOCODIO_API_KEY is not set")
+
+    with log.step("connect_snowflake"):
+        sf_conn = create_snowflake_connection()
+
+    try:
+        with log.step("fetch_addresses") as s:
+            addresses_df = fetch_addresses_to_geocode(sf_conn, BATCH_SIZE)
+            s.rows = len(addresses_df)
+            if len(addresses_df) == 0:
+                s.status = "SKIPPED"
+
+        if len(addresses_df) == 0:
+            log.info("No addresses need geocoding")
+            log.finish(override_status="SKIPPED")
+            return
+
+        with log.step("fetch_districts") as s:
+            districts_df = fetch_district_lookup(sf_conn)
+            s.rows = len(districts_df)
+
+        geocode_error = None
+        with log.step("geocode_addresses") as s:
+            try:
+                api_results = batch_geocode_addresses(addresses_df, GEOCODIO_API_KEY)
+            except GeocodioFatalError as exc:
+                if len(exc.results) != len(addresses_df):
+                    raise
+                # Save the lookups completed (and paid for) before the abort;
+                # the run is failed once they are written.
+                geocode_error = exc
+                api_results = exc.results
+                s.status = "FAILED"
+                s.error_type = type(exc).__name__
+                s.error_summary = str(exc)
+            results_df = parse_geocode_results(api_results, addresses_df)
+            success_count = int(results_df['success'].sum())
+            failed_count = int((~results_df['success']).sum())
+            s.rows = success_count
+            s.rows_failed = failed_count
+            if success_count > 0:
+                successful = results_df[results_df['success']]
+                s.metadata["avg_accuracy"] = round(
+                    successful['accuracy'].mean(), 3
+                )
+                census_complete = successful[
+                    successful['tract_code'].notna() & successful['block_code'].notna()
+                ]
+                s.metadata["census_enrichment_rate"] = round(
+                    len(census_complete) / success_count, 3
+                )
+
+        with log.step("enrich_districts") as s:
+            results_df = enrich_with_district_ids(results_df, districts_df)
+            matched = int((results_df['DISTRICTID'] > 0).sum())
+            s.rows = matched
+            s.metadata["district_match_rate"] = round(
+                matched / len(results_df), 3
+            ) if len(results_df) > 0 else 0.0
+
+        with log.step("log_to_snowflake", fatal=False) as s:
+            sf_success, sf_errors_count = log_results_to_snowflake(results_df, sf_conn)
+            s.rows = sf_success
+            s.rows_failed = sf_errors_count
+
+        with log.step("update_ic") as s:
+            ic_conn = create_ic_connection()
+            try:
+                ic_success, ic_errors_count = update_ic_addresses(results_df, ic_conn)
+                s.rows = ic_success
+                s.rows_failed = ic_errors_count
+                s.metadata["skipped_below_threshold"] = (
+                    len(results_df) - ic_success - ic_errors_count
+                )
+            finally:
+                _close_quietly(ic_conn, "Infinite Campus")
+
+        if geocode_error is not None:
+            raise geocode_error
+
+    finally:
+        _close_quietly(sf_conn, "Snowflake")
+
+
 def main() -> None:
     """
     Main execution function.
 
-    Orchestrates the entire geocoding process using AppLogger
-    for structured NDJSON logging with step-level observability.
+    Owns the AppLogger run lifecycle and the process exit code; the steps
+    themselves live in run_pipeline().
     """
     # Open a dedicated Snowflake connection for app_logger dual-write.
     # Best-effort: if Snowflake is unreachable, log locally and continue without
@@ -914,8 +1115,11 @@ def main() -> None:
     try:
         sf_log_conn = create_snowflake_connection(database="LOGS")
     except Exception as exc:
-        # We don't have AppLogger yet, so use stdlib logging.
-        logging.warning("Could not open Snowflake connection for app_logger: %s", exc)
+        # No AppLogger yet. Use the module logger, not logging.warning(): with
+        # no root handlers that would basicConfig() a raw stderr handler that
+        # outlives this call and bypasses app_logger's redaction.
+        logger.warning("Could not open Snowflake connection for app_logger: %s",
+                       _describe_db_error(exc))
 
     log = AppLogger(
         "Address_Geocoding",
@@ -927,81 +1131,32 @@ def main() -> None:
     )
     log.start(trigger="cron", schedule="0 17 * * *")
 
+    # app_logger only reports FAILED when *every* step failed, so a fatal
+    # failure after validate_config would otherwise be recorded as PARTIAL
+    # and exit 0. Force FAILED whenever a fatal error ends the run.
+    failed = False
     try:
-        with log.step("validate_config") as s:
-            validate_config()
-            if not GEOCODIO_API_KEY:
-                raise EnvironmentError("GEOCODIO_API_KEY is not set")
-
-        with create_snowflake_connection() as sf_conn:
-
-            with log.step("fetch_addresses") as s:
-                addresses_df = fetch_addresses_to_geocode(sf_conn, BATCH_SIZE)
-                s.rows = len(addresses_df)
-                if len(addresses_df) == 0:
-                    s.status = "SKIPPED"
-
-            if len(addresses_df) == 0:
-                log.info("No addresses need geocoding")
-                log.finish(override_status="SKIPPED")
-                return
-
-            with log.step("fetch_districts") as s:
-                districts_df = fetch_district_lookup(sf_conn)
-                s.rows = len(districts_df)
-
-            with log.step("geocode_addresses") as s:
-                api_results = batch_geocode_addresses(addresses_df, GEOCODIO_API_KEY)
-                results_df = parse_geocode_results(api_results, addresses_df)
-                success_count = int(results_df['success'].sum())
-                failed_count = int((~results_df['success']).sum())
-                s.rows = success_count
-                s.rows_failed = failed_count
-                if success_count > 0:
-                    successful = results_df[results_df['success']]
-                    s.metadata["avg_accuracy"] = round(
-                        successful['accuracy'].mean(), 3
-                    )
-                    census_complete = successful[
-                        successful['tract_code'].notna() & successful['block_code'].notna()
-                    ]
-                    s.metadata["census_enrichment_rate"] = round(
-                        len(census_complete) / success_count, 3
-                    )
-
-            with log.step("enrich_districts") as s:
-                results_df = enrich_with_district_ids(results_df, districts_df)
-                matched = int((results_df['DISTRICTID'] > 0).sum())
-                s.rows = matched
-                s.metadata["district_match_rate"] = round(
-                    matched / len(results_df), 3
-                ) if len(results_df) > 0 else 0.0
-
-            with log.step("log_to_snowflake", fatal=False) as s:
-                sf_success, sf_errors_count = log_results_to_snowflake(results_df, sf_conn)
-                s.rows = sf_success
-                s.rows_failed = sf_errors_count
-
-            with log.step("update_ic") as s:
-                ic_conn = create_ic_connection()
-                try:
-                    ic_success, ic_errors_count = update_ic_addresses(results_df, ic_conn)
-                    s.rows = ic_success
-                    s.rows_failed = ic_errors_count
-                    s.metadata["skipped_below_threshold"] = (
-                        len(results_df) - ic_success - ic_errors_count
-                    )
-                finally:
-                    ic_conn.close()
-
+        run_pipeline(log)
+    except Exception as exc:
+        failed = True
+        # Codes only: exception text can carry addresses or credentials.
+        logger.error("Run aborted by %s", _describe_db_error(exc))
+    except BaseException as exc:
+        # SIGTERM (SystemExit 143) or Ctrl-C: record FAILED, keep the exit code.
+        # Suppress the chained context: Ctrl-C during a retry sleep or inside
+        # requests would otherwise print the driver error / URL to stderr.
+        failed = True
+        exc.__suppress_context__ = True
+        raise
     finally:
-        status = log.finish()
+        status = log.finish(override_status="FAILED" if failed else None)
         if sf_log_conn is not None:
             try:
                 sf_log_conn.close()
             except Exception:
                 pass
-        sys.exit(ExitCode.SUCCESS if status in ("SUCCESS", "PARTIAL", "SKIPPED") else ExitCode.FAILED)
+
+    sys.exit(ExitCode.SUCCESS if status in ("SUCCESS", "PARTIAL", "SKIPPED") else ExitCode.FAILED)
 
 
 if __name__ == "__main__":

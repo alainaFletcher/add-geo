@@ -22,7 +22,7 @@ The application follows a single-script architecture with three primary database
    - Logs all Geocode.io API responses to `LOGGING_GEOCODIOAPI_ADDRESSLOOKUPS` as JSON
 
 3. **Geocode.io API** - External geocoding service
-   - Requests include fields: school districts, zip+4, census 2024 data
+   - Requests include fields: school districts, zip+4, census 2025 data (`API_FIELDS`)
    - Returns lat/lng coordinates, census tract/block, county FIPS, and school district LEA codes
 
 ### Logging
@@ -39,6 +39,7 @@ The application uses `app_logger` for structured NDJSON logging. The `app_logger
 | Step | Fatal | Description |
 |------|-------|-------------|
 | `validate_config` | Yes | Checks required env vars and API key |
+| `connect_snowflake` | Yes | Opens the main Snowflake connection |
 | `fetch_addresses` | Yes | Queries Snowflake for addresses needing geocoding |
 | `fetch_districts` | Yes | Loads district lookup table from Snowflake |
 | `geocode_addresses` | Yes | Calls Geocodio API per address, parses results |
@@ -75,10 +76,26 @@ The script has no command-line arguments. It processes up to 500 addresses per r
 
 - **Accuracy threshold**: Only addresses with accuracy >= 0.8 are written to IC database
 - **District ID matching**: LEA codes from Geocode.io are matched against `NCESDISTRICTID` in the district table
-- **Error handling**: Fatal steps propagate exceptions; `log_to_snowflake` is non-fatal so IC updates still happen
+- **Error handling**: `main()` owns the run lifecycle; the steps live in `run_pipeline()`. Any exception escaping `run_pipeline()` forces run status `FAILED` and exit 1 — app_logger on its own only reports `FAILED` when *every* step failed, otherwise `PARTIAL`, which `main()` maps to exit 0. `log_to_snowflake` is non-fatal (and does its own `commit()`), so IC updates still happen. Closing connections at teardown is best-effort (`_close_quietly`). SIGTERM keeps exit code 143.
+- **Geocodio failures**: `GeocodioFatalError` ends geocoding on 401/403/429 (bad key, quota exhausted, rate limit), after `MAX_CONSECUTIVE_GEOCODE_FAILURES` (5) non-422 failures in a row, or when no lookup succeeded and any failed for a non-422 reason (small-batch outage). Its `results` carries the lookups completed before the abort; `run_pipeline()` still parses, audits, and writes those to IC, marks `geocode_addresses` FAILED, then re-raises so the run ends `FAILED`. A 422 (unparseable address) is per-row and neutral to the breaker. Per-row failures are retried on the next run.
+- **Geocodio auth**: API key is sent as `Authorization: Bearer`, never as the `api_key` query parameter
 - **Batch size**: Configurable via `BATCH_SIZE` env var (default 500)
-- **Census data**: Uses 2024 census tract, block, and county FIPS codes
-- **FERPA**: No student addresses, coordinates, or PII are written to log files
+- **Census data**: Uses 2025 census tract, block, and county FIPS codes (`census2025` field; parser reads `fields.census['2025']`)
+- **FERPA**: No student addresses, coordinates, or PII are written to log files. Rules that keep it true:
+  - Never interpolate text from `requests`, pyodbc, or Snowflake-connector exceptions (`{e}`, `str(e)`, `e.msg`) into log messages; use `_describe_db_error(e)` (type + errno/SQLSTATE) or `type(e).__name__`. `requests` errors embed the URL (`q=<address>`), pyodbc errors name the login, Snowflake errors can echo bound row data.
+  - When such an exception would escape a `log.step()`, re-raise a sanitized one `from None` (or raise outside the `except` block) — app_logger records `str(exc)` and the full chained traceback to NDJSON, Snowflake LOGS, and email/Teams notifications, and its redaction does not catch addresses. See `GeocodioFatalError`, the `ConnectionError`s in the connection helpers, and the `RuntimeError`s in the fetch helpers.
+  - urllib3 WARNINGs include the full URL (e.g. "Failed to parse headers (url=...)" on a malformed response header; `Retry`'s "Retrying ... url"). `create_geocodio_session()` raises the `urllib3` loggers to ERROR (urllib3 logs nothing at ERROR+). Don't lower them, and don't add a urllib3 `Retry`.
+  - Before `AppLogger()` exists, log via the module `logger`, never `logging.warning()` — with no root handlers the latter calls `basicConfig()`, leaving a raw stderr handler that bypasses app_logger redaction for the whole run.
+  - `main()` sets `__suppress_context__` on `BaseException`s (Ctrl-C/SIGTERM) so an interrupt inside an `except` block (retry sleep, requests internals) doesn't print the chained driver error or URL.
+
+## Testing
+
+```bash
+pip install vendor/app_logger-*.whl -r requirements.txt -r requirements-dev.txt
+python -m pytest tests/ -q
+```
+
+Tests are offline. `tests/conftest.py` disables `.env` loading (`PYTHON_DOTENV_DISABLED`) and sets fake credentials before `GeocodeAddresses` is imported. `main()` tests use the real `AppLogger` redirected to `tmp_path` with `notify=False` — never let a test construct an AppLogger with notifications on (real `.env` has a Teams webhook).
 
 ## Docker
 
