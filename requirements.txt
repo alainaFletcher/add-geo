@@ -6,7 +6,10 @@ requests>=2.31.0
 
 # Database connectivity
 pyodbc>=5.0.0
-snowflake-connector-python[pandas]>=3.0.0
+# <5: 5.x's Rust core logs a WARNING on every connection ("Proxy configuration:
+# using environment variable proxy settings"), which fires a notification every
+# run. Upgrade deliberately, with that logger handled.
+snowflake-connector-python[pandas]>=3.0.0,<5
 
 # Data processing
 pandas>=2.0.0
