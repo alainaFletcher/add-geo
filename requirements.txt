@@ -12,4 +12,5 @@ snowflake-connector-python[pandas]>=3.0.0
 pandas>=2.0.0
 
 # Environment variable management
-python-dotenv>=1.0.0
+# >=1.2.0 for PYTHON_DOTENV_DISABLED, which tests/conftest.py relies on
+python-dotenv>=1.2.0
