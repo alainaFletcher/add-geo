@@ -142,6 +142,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .envrc
 .venv
 env/
@@ -211,3 +213,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project-specific
+# Local-run logs (APP_LOG_ROOT defaults to ./logs). May contain address IDs and
+# run summaries -- never commit.
+logs/
+# Portfolio-wide agent instruction sets; canonical copy lives in the LogReader repo.
+InstructionSets/
