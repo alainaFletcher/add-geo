@@ -113,7 +113,7 @@ def test_ic_update_failure_logs_no_row_content(caplog, error):
     ic_conn = MagicMock()
     ic_conn.cursor.return_value.execute.side_effect = error
     results = pd.DataFrame([{
-        "ADDRESSID": 7, "success": True, "accuracy": 1.0, "latitude": 39.8,
+        "ADDRESSID": 7, "success": True, "accuracy": 1.0, "accuracy_type": "rooftop", "latitude": 39.8,
         "longitude": -104.9, "tract_code": "009307", "block_code": "2018",
         "county_fips": "08001", "DISTRICTID": 17,
     }])

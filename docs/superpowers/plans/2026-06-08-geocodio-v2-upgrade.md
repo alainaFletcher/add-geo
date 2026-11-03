@@ -1,5 +1,7 @@
 # Geocodio v1.12 → v2 Upgrade Implementation Plan
 
+> **Historical record.** Implemented and merged in Mapleton-IT/Address-Geocoding#2. Code has moved on since (e.g. v2.1 default, header auth, fatal-error handling, IC write policy); `README.md` and `CLAUDE.md` describe current behavior. Line numbers and smoke-test steps here are out of date — smoke-test via the Docker command in `README.md`, not by running the script locally.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Cut over the daily geocoding cron from Geocodio API v1.12 to v2, and bundle a census append-year switch from `census2024` to `census2025`, with zero observable change in production IC writes.

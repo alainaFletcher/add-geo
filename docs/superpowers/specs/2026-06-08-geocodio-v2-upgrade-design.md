@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-08
 **Author:** Brian Fuller
-**Status:** Approved (pending implementation plan)
+**Status:** Implemented (Mapleton-IT/Address-Geocoding#2, merged). Default later moved to v2.1 (Mapleton-IT/Address-Geocoding#3).
 **Approach:** A — Straight cutover with bundled census2024 → census2025 switch
 
 ## Context
