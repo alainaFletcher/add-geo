@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-30
 **Author:** Brian Fuller
-**Status:** Approved (pending implementation plan)
+**Status:** Implemented (Mapleton-IT/Address-Geocoding#1, merged). Superseded by the v2 upgrade (2026-06-08 design).
 **Approach:** B — Targeted hardening upgrade
 
 ## Context

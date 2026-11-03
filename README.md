@@ -1,6 +1,8 @@
 # Address Geocoding Application
 
-An internal application that geocodes student and parent addresses from Infinite Campus using the Geocod.io API. The application enriches addresses with census data and school district information, then updates both Infinite Campus and Snowflake databases.
+An internal daily job that geocodes student and parent addresses from Infinite Campus (IC) using the [Geocodio](https://www.geocod.io/) API, then writes coordinates, 2025 census tract/block, county FIPS, and school district back to IC. Every Geocodio response is also stored in Snowflake as an audit trail.
+
+Addresses are student PII (FERPA). The job never writes addresses, coordinates, credentials, or driver error text to its logs; see [Privacy](#privacy-ferpa).
 
 ## Table of Contents
 
@@ -10,336 +12,263 @@ An internal application that geocodes student and parent addresses from Infinite
 - [Configuration](#configuration)
 - [Running with Docker](#running-with-docker)
 - [Running Locally](#running-locally)
-- [Application Workflow](#application-workflow)
-- [Database Updates](#database-updates)
-- [Logging](#logging)
+- [Testing](#testing)
+- [How Addresses Are Selected](#how-addresses-are-selected)
+- [Pipeline Steps](#pipeline-steps)
+- [Geocodio](#geocodio)
+- [What Gets Written](#what-gets-written)
+- [Logging and Alerts](#logging-and-alerts)
+- [Exit Codes](#exit-codes)
 - [Troubleshooting](#troubleshooting)
+- [File Structure](#file-structure)
 
 ## Overview
 
-This application:
+Each run works in phases, not address by address:
 
-1. Fetches addresses needing geocoding from Snowflake (`VIEW_ADDRESSESNEEDINGGEOCODED`)
-2. Geocodes each address using the Geocod.io API
-3. Enriches results with census tract/block data and school district LEA codes
-4. Logs all API responses to Snowflake for auditing
-5. Updates the Infinite Campus `ADDRESS` table with geocoded data
+1. Fetch up to `BATCH_SIZE` addresses from the Snowflake view `VIEW_ADDRESSESNEEDINGGEOCODED`
+2. Geocode each address with one Geocodio call, then parse every response
+3. Match each address's school district (LEA code) to an IC district ID
+4. Insert every Geocodio response into the Snowflake audit table
+5. Update the IC `ADDRESS` table for confident, house-level matches
 
 ## Architecture
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
 │                 │     │                 │     │                 │
-│   Snowflake     │◄────│  GeocodeApp     │────►│  Geocod.io API  │
-│   (read/write)  │     │  (Python)       │     │  (external)     │
+│   Snowflake     │◄────│ GeocodeAddresses│────►│  Geocodio API   │
+│   (read/write)  │     │  (Python, cron) │     │  (external)     │
 │                 │     │                 │     │                 │
 └─────────────────┘     └────────┬────────┘     └─────────────────┘
                                  │
-                                 │
                                  ▼
                         ┌─────────────────┐
-                        │                 │
                         │ Infinite Campus │
-                        │ (SQL Server)    │
-                        │                 │
+                        │  (SQL Server)   │
                         └─────────────────┘
 ```
 
-### Data Sources
-
 | System | Purpose | Connection |
 |--------|---------|------------|
-| Snowflake | Source of addresses, API response logging, district lookup | snowflake-connector-python |
-| Infinite Campus | Target for geocoded address updates | pyodbc (ODBC Driver 18) |
-| Geocod.io | External geocoding API | REST API (requests) |
+| Snowflake | Address source (view), district lookup, response audit log, `app_logger` run logs | `snowflake-connector-python` 4.x, RSA key-pair auth |
+| Infinite Campus | Target for geocoded address updates | `pyodbc` + ODBC Driver 18 |
+| Geocodio | Geocoding, census, and school-district appends | REST (`requests`), API key in `Authorization: Bearer` header |
 
-### Key Tables/Views
-
-| Object | Database | Purpose |
-|--------|----------|---------|
-| `VIEW_ADDRESSESNEEDINGGEOCODED` | Snowflake | Addresses requiring geocoding |
-| `LOGGING_GEOCODIOAPI_ADDRESSLOOKUPS` | Snowflake | Audit log of all API responses |
-| `DISTRICT` | Snowflake | LEA code to District ID mapping |
+| Object | Where | Purpose |
+|--------|-------|---------|
+| `MPS_WAREHOUSE.DATALAKE.VIEW_ADDRESSESNEEDINGGEOCODED` | Snowflake | Addresses to geocode (see [How Addresses Are Selected](#how-addresses-are-selected)) |
+| `MPS_WAREHOUSE.IC.DISTRICT` | Snowflake | NCES district ID → IC district ID lookup |
+| `LOGGING_GEOCODIOAPI_ADDRESSLOOKUPS` | Snowflake (`SNOWFLAKE_DATABASE`.`SNOWFLAKE_SCHEMA`) | Audit log of every Geocodio response |
+| `LOGS.DATALAKE.ETL_RUN_SUMMARIES` / `ETL_LOG_LINES` | Snowflake | `app_logger` run summaries and log lines |
 | `ADDRESS` | Infinite Campus | Target table for updates |
 
 ## Prerequisites
 
-### For Docker (Recommended)
+**Docker (how production runs):** Docker Desktop and a configured `.env`.
 
-- Docker Desktop installed and running
-- `.env` file configured (see [Configuration](#configuration))
-
-### For Local Development
-
-- Python 3.11+
-- Microsoft ODBC Driver 18 for SQL Server
-- Access to Snowflake and Infinite Campus databases
+**Local development:** Python 3.13 (matches the image), Microsoft ODBC Driver 18 for SQL Server and unixODBC, and network access to Snowflake and IC for real runs. Tests need none of the databases.
 
 ## Configuration
 
-1. Copy the example environment file:
-   ```bash
-   cp .env.example .env
-   ```
+```bash
+cp .env.example .env    # then fill in real values; never commit .env
+```
 
-2. Edit `.env` with your credentials:
+`.env.example` documents every variable. The important ones:
 
-   ```ini
-   # Snowflake Data Warehouse (Key Pair Auth)
-   SNOWFLAKE_USER=your_username
-   SNOWFLAKE_PRIVATE_KEY_B64=your_base64_encoded_private_key
-   # SNOWFLAKE_PRIVATE_KEY_PASSPHRASE=optional_passphrase
-   SNOWFLAKE_ACCOUNT=dv56305.west-us-2.azure
-   SNOWFLAKE_WAREHOUSE=dataloadingonly
-   SNOWFLAKE_DATABASE=MPS_Warehouse
-   SNOWFLAKE_SCHEMA=datalake
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `SNOWFLAKE_USER`, `SNOWFLAKE_PRIVATE_KEY_B64` | (required) | Base64-encoded PEM; optional `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE` |
+| `IC_DB_USER`, `IC_DB_PASSWORD` | (required) | |
+| `GEOCODIO_API_KEY` | (required) | |
+| `GEOCODIO_API_VERSION` | `v2.1` | Bump here when Geocodio publishes a new version (the job logs a deprecation WARNING when it does) |
+| `BATCH_SIZE` | `500` | Max addresses per run |
+| `ACCURACY_THRESHOLD` | `0.8` | Minimum Geocodio accuracy score written to IC |
+| `NOTIFICATION_*` | off | Email/Teams alerts from `app_logger`; see `.env.example` |
+| `APP_LOG_ROOT` | `./logs` | docker-compose sets `/app/logs` |
 
-   # Infinite Campus Database (SQL Server)
-   IC_DB_USER=your_username
-   IC_DB_PASSWORD=your_password
-   IC_DB_SERVER=icampus.mapleton.us,7771
-   IC_DB_DATABASE=mapleton
-   IC_DB_DRIVER=ODBC Driver 18 for SQL Server
-
-   # Geocod.io API
-   GEOCODIO_API_KEY=your_api_key
-
-   # Application Settings
-   BATCH_SIZE=500              # Addresses per run
-   ACCURACY_THRESHOLD=0.8      # Minimum accuracy to update IC (0.0-1.0)
-   LOG_LEVEL=INFO              # DEBUG, INFO, WARNING, ERROR
-   ```
-
-### Configuration Notes
-
-- **BATCH_SIZE**: Controls how many addresses are processed per run. Default is 500. Lower this for testing.
-- **ACCURACY_THRESHOLD**: Only addresses with geocoding accuracy >= this value are written to Infinite Campus. Default is 0.8 (80%).
-- **Never commit `.env` to git** - it contains secrets.
+**`.env` overrides every in-code default.** docker-compose loads it via `env_file:` and the script calls `load_dotenv()`. Changing a default in code does nothing if `.env` sets the variable; update `.env` too. Keep comments on their own lines (no trailing `# comment` after a value).
 
 ## Running with Docker
 
-Docker is the recommended way to run this application.
+Production runs from the Mac mini's user crontab, daily at 09:50 local time:
 
-### Build the Image
-
-```bash
-docker-compose build
+```
+50 9 * * * cd ~/Projects/Address-Geocoding && /usr/local/bin/docker-compose run --rm geocoding
 ```
 
-### Run the Application
-
-**One-time execution (recommended):**
-```bash
-docker-compose run --rm geocoding
-```
-
-This runs the application, processes addresses, and removes the container when complete. Logs are persisted to `./logs/`.
-
-**Run in foreground:**
-```bash
-docker-compose up
-```
-
-**Run in background:**
-```bash
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-```
-
-### Rebuild After Code Changes
+The container runs once and exits; there is no long-running service.
 
 ```bash
-docker-compose build --no-cache
-docker-compose run --rm geocoding
+docker compose build                                    # required after any code or requirements change
+docker compose run --rm geocoding                       # one run
+docker compose run --rm -e BATCH_SIZE=1 geocoding       # smoke test
 ```
+
+- **Rebuild after every change.** `run --rm` reuses the existing `address-geocoding:latest` image; without `build`, the old code keeps running.
+- **Every run writes to production IC.** There is no dry-run mode. A `BATCH_SIZE=1` smoke test updates at most one real address (often zero, if it scores below the threshold). Check the `RUN_END` line: `status`, `steps_total: 8`, `warning_count`.
 
 ## Running Locally
 
-If you need to run outside Docker (for debugging):
+Prefer the Docker smoke test above. Running the script directly also writes to production IC and logs to `./logs`.
 
-### macOS Setup
+```bash
+python3.13 -m venv .venv && source .venv/bin/activate
+pip install vendor/app_logger-*.whl -r requirements.txt -r requirements-dev.txt
+python GeocodeAddresses.py
+```
 
-1. Install ODBC driver:
-   ```bash
-   brew install microsoft/mssql-release/msodbcsql18
-   brew install unixodbc
-   ```
+On macOS, install the driver with `brew install microsoft/mssql-release/msodbcsql18 unixodbc`; the script auto-detects Homebrew's ODBC config.
 
-2. Create virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
+## Testing
 
-3. Run:
-   ```bash
-   python GeocodeAddresses.py
-   ```
+```bash
+pip install vendor/app_logger-*.whl -r requirements.txt -r requirements-dev.txt
+python -m pytest tests/ -q
+```
 
-### Windows Setup
+Tests are offline and never touch Snowflake, IC, or Geocodio. `tests/conftest.py` disables `.env` loading (`PYTHON_DOTENV_DISABLED`) and sets fake credentials before the module is imported, so a developer's real `.env` (credentials, Teams webhook) is never read. `main()` tests use the real `AppLogger` writing to a temp directory with notifications off.
 
-1. Download and install [ODBC Driver 18 for SQL Server](https://docs.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server)
+## How Addresses Are Selected
 
-2. Create virtual environment:
-   ```bash
-   python -m venv venv
-   venv\Scripts\activate
-   pip install -r requirements.txt
-   ```
+`VIEW_ADDRESSESNEEDINGGEOCODED` is maintained in Snowflake (not in this repo). It returns `ADDRESSID` and a formatted `ADDRESSLINE1` for addresses that are:
 
-3. Run:
-   ```bash
-   python GeocodeAddresses.py
-   ```
+- the mailing address of a household with a student enrolled in the active school year
+- in Colorado, not a PO box, with number, street, city, state, and zip present
+- **and** either never looked up, modified in IC since the latest audit-log row, or still missing `location_code` or `districtid` in IC
 
-## Application Workflow
+The Snowflake copy of IC refreshes nightly, so each run sees the previous night's IC data. Any address the job doesn't fully write (score below threshold, not a house-level match, no census data, no district match) is selected and looked up again every run. That is intentional.
 
-The application executes the following steps:
+## Pipeline Steps
 
-| Step | Description |
-|------|-------------|
-| 1 | Validate configuration (check all required env vars) |
-| 2 | Validate Geocod.io API key |
-| 3 | Connect to Snowflake |
-| 4 | Fetch addresses to geocode (up to BATCH_SIZE) |
-| 5 | Fetch district lookup table (LEA code → District ID) |
-| 6 | Geocode addresses via Geocod.io API |
-| 7 | Parse geocoding results |
-| 8 | Enrich with district IDs |
-| 9 | Log results to Snowflake |
-| 10 | Update Infinite Campus database |
+Each step is tracked by `app_logger`. If a fatal step fails, the run ends as `FAILED` (exit 1).
 
-### Geocod.io API Fields
+| Step | Fatal | Description |
+|------|-------|-------------|
+| `validate_config` | Yes | Required environment variables are set |
+| `connect_snowflake` | Yes | Opens the main Snowflake connection |
+| `fetch_addresses` | Yes | Reads the view (`SKIPPED` run if empty) |
+| `fetch_districts` | Yes | Loads the district lookup |
+| `geocode_addresses` | Yes | Calls Geocodio per address and parses results |
+| `enrich_districts` | Yes | Matches LEA codes to IC district IDs |
+| `log_to_snowflake` | **No** | Inserts raw responses into the audit table |
+| `update_ic` | Yes | Writes results to IC |
 
-The application requests these fields from Geocod.io:
+## Geocodio
 
-- `school` - School district information (LEA codes)
-- `zip4` - ZIP+4 codes
-- `census2024` - Census tract, block, and county FIPS codes
+- **Endpoint:** `GET https://api.geocod.io/{GEOCODIO_API_VERSION}/geocode`, one call per address, with fields `school`, `zip4`, and `census2025`.
+- **Auth:** API key in the `Authorization: Bearer` header, never in the URL (requests puts URLs into error messages).
+- **Failure handling:**
 
-## Database Updates
+  | Situation | Behavior |
+  |-----------|----------|
+  | HTTP 403 (invalid key or daily quota used up), 401, 429 (rate limit) | Stop geocoding at once |
+  | 5 non-422 failures in a row (outage, network) | Stop geocoding |
+  | Zero successful lookups and at least one non-422 failure (small-batch outage) | Stop geocoding |
+  | 422 (address Geocodio can't parse) | That row fails; the run continues |
+  | Isolated 5xx / timeout / bad response | That row fails; the run continues |
 
-### Snowflake Logging
+  When geocoding stops, the lookups already completed are still audited and written to IC, then the run ends `FAILED`. There is deliberately no automatic retry (urllib3's retry logging would leak the address URL); unsuccessful addresses are retried by the next run.
 
-Every API response is logged to `LOGGING_GEOCODIOAPI_ADDRESSLOOKUPS`:
+## What Gets Written
 
-| Column | Type | Description |
-|--------|------|-------------|
-| IC_ADDRESSID | INTEGER | Address ID from Infinite Campus |
-| GEOCODIO_JSON | VARIANT | Full JSON response from Geocod.io |
+### Infinite Campus (`ADDRESS`)
 
-### Infinite Campus Updates
+A result is written only if **both**:
 
-Addresses meeting the accuracy threshold are updated in the `ADDRESS` table:
+- accuracy ≥ `ACCURACY_THRESHOLD` (a missing score is never written), and
+- `accuracy_type` is house-level: `rooftop`, `point`, `range_interpolation`, or `nearest_rooftop_match`. `intersection` and `street_center` only locate a street; `place`, `county`, and `state` mean Geocodio did not find the address.
 
 | Column | Source |
 |--------|--------|
-| latitude | Geocod.io location.lat |
-| longitude | Geocod.io location.lng |
-| tract | Census 2024 tract_code |
-| block | Census 2024 block_code |
-| location_code | Census 2024 county_fips |
-| districtID | Matched from LEA code (if found) |
+| `latitude`, `longitude` | `results[0].location` |
+| `tract` | `fields.census["2025"].tract_code` |
+| `block` | `fields.census["2025"].block_code` |
+| `location_code` | `fields.census["2025"].county_fips` |
+| `districtID` | IC district matched from `fields.school_districts.unified.lea_code` via `MPS_WAREHOUSE.IC.DISTRICT.NCESDISTRICTID` |
 
-**Note:** `districtID` is only updated if the LEA code matches a district in the lookup table.
+These columns are owned by this job (users don't edit them), so the job writes exactly what the geocode says. Missing census values are written as NULL (with a WARNING), and an unmatched district writes `districtID = NULL`. Values from a previous location are never kept. District matching ignores `'0000'` (no unified district returned) and any NCES ID that maps to more than one IC district (logged as a WARNING).
 
-## Logging
+### Snowflake audit (`LOGGING_GEOCODIOAPI_ADDRESSLOOKUPS`)
 
-Logs are written to:
+| Column | Description |
+|--------|-------------|
+| `IC_ADDRESSID` | IC address ID |
+| `GEOCODIO_JSON` | Full Geocodio response (`VARIANT`) |
 
-- **Console**: Always (visible in terminal/docker logs)
-- **File**: `./logs/geocoding.log` (persisted via Docker volume mount)
+Every response received is inserted, including no-result and low-accuracy responses. Requests that got no response (network errors, aborted batch) are not. This step is non-fatal, so an audit failure leaves the run `PARTIAL` and IC updates still happen. The view uses this table's latest row per address to decide what's already been looked up.
 
-### Log Levels
+## Logging and Alerts
 
-Set via `LOG_LEVEL` environment variable:
+The job uses the vendored `app_logger` (`vendor/app_logger-*.whl`, not on PyPI) for structured NDJSON logs:
 
-| Level | Description |
-|-------|-------------|
-| DEBUG | Detailed information for debugging |
-| INFO | General operational messages (default) |
-| WARNING | Unexpected situations that aren't errors |
-| ERROR | Errors that prevent operation |
+| Output | Location | Retention |
+|--------|----------|-----------|
+| Main log | `$APP_LOG_ROOT/Address_Geocoding/daily_geocode_YYYYMMDD.log` | 90 days |
+| Errors-only log | `$APP_LOG_ROOT/Address_Geocoding/daily_geocode_errors_YYYYMMDD.log` | 180 days |
+| Run index (one line per run) | `$APP_LOG_ROOT/_index/runs_YYYYMM.jsonl` | 365 days |
+| Snowflake (best effort) | `LOGS.DATALAKE.ETL_RUN_SUMMARIES`, `ETL_LOG_LINES` | n/a |
+| Console | stdout, JSON in Docker (`CONSOLE_FORMAT=json`) | Docker json-file (10 MB × 3) |
 
-### Sample Log Output
+In Docker, `APP_LOG_ROOT=/app/logs` is mounted from `../LogReader/logs`, which the LogReader dashboard reads.
 
-```
-2024-01-15 10:30:00 - geocoding - INFO - ============================================================
-2024-01-15 10:30:00 - geocoding - INFO - Starting Address Geocoding Application v2.0
-2024-01-15 10:30:00 - geocoding - INFO - ============================================================
-2024-01-15 10:30:00 - geocoding - INFO - Step 1: Validating configuration...
-2024-01-15 10:30:00 - geocoding - INFO - Configuration validated successfully
-2024-01-15 10:30:01 - geocoding - INFO - Step 4: Fetching addresses to geocode...
-2024-01-15 10:30:02 - geocoding - INFO - Successfully fetched 500 addresses
-2024-01-15 10:30:45 - geocoding - INFO - Geocoding complete: 498 successful, 2 failed
-2024-01-15 10:30:46 - geocoding - INFO - IC update complete: 485 updated, 0 errors, 15 skipped
-```
+**Alerts:** when notifications are enabled, `app_logger` sends an email/Teams digest at the end of a run if the run `FAILED` or any line is at or above `NOTIFICATION_LEVEL` (default `WARNING`). Any WARNING therefore alerts. Expected per-address WARNINGs include "No district match", "Invalid geocoding request", and "Incomplete census data".
 
-## Troubleshooting
+### Privacy (FERPA)
 
-### ODBC Driver Not Found (macOS)
+Logs carry address IDs, counts, error types, and error codes only. The code guarantees this by:
 
-**Error:** `Can't open lib 'ODBC Driver 18 for SQL Server' : file not found`
+- never putting `requests`, urllib3, pyodbc, or Snowflake exception text in log messages (error type plus errno/SQLSTATE only)
+- re-raising errors that escape a step as sanitized exceptions (`from None`)
+- keeping urllib3 logging at ERROR (its WARNINGs include the request URL)
 
-**Solution:** The application auto-detects Homebrew's ODBC path on macOS. If running locally with Anaconda, ensure the driver is installed:
-```bash
-brew install microsoft/mssql-release/msodbcsql18
-```
-
-### Connection Timeouts
-
-The application includes retry logic with exponential backoff for both Snowflake and Infinite Campus connections. If connections consistently fail:
-
-1. Check network connectivity
-2. Verify credentials in `.env`
-3. Ensure you're on the correct network/VPN
-
-### Low Accuracy Results
-
-If many addresses are skipped due to low accuracy:
-
-1. Check the address data quality in Infinite Campus
-2. Review skipped addresses in the logs (DEBUG level)
-3. Consider lowering `ACCURACY_THRESHOLD` (not recommended below 0.7)
-
-### Geocod.io Rate Limits
-
-The application makes individual API calls (not batch). If you hit rate limits:
-
-1. Reduce `BATCH_SIZE`
-2. Check your Geocod.io plan limits
-3. Add delays between requests (requires code modification)
+`CLAUDE.md` lists the rules for anyone changing the code. The audit table, by design, stores full addresses and coordinates.
 
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success |
-| 1 | Configuration error |
-| 2 | Geocod.io authentication error |
-| 3 | Geocod.io HTTP error |
-| 4 | Geocod.io request error |
-| 5 | Snowflake database error |
-| 6 | Infinite Campus database error |
-| 7 | Unexpected error |
+| 0 | `SUCCESS`, `PARTIAL` (some rows or the non-fatal audit step failed), or `SKIPPED` (nothing to geocode) |
+| 1 | `FAILED`: a fatal step failed or Geocodio stopped the batch |
+| 143 | Terminated by SIGTERM (run recorded `FAILED`) |
+
+The real outcome, including `PARTIAL`, is in the run index and `RUN_END` line.
+
+## Troubleshooting
+
+**A run is `FAILED`.** Open the errors log or the run index entry; `failed_steps` names the step and a sanitized error.
+
+| `error_type` / message | Likely cause |
+|------------------------|--------------|
+| `GeocodioFatalError ... (HTTP 403)` | Invalid/revoked API key or daily quota used up |
+| `GeocodioFatalError ... (HTTP 429)` | Pay-as-you-go rate limit |
+| `GeocodioFatalError ... consecutive ...` or `No successful Geocodio lookups` | Geocodio outage or network problem |
+| `ConnectionError: Infinite Campus connection failed ... (SQLSTATE 28000)` | IC login failed (credentials) |
+| `ConnectionError: Snowflake connection failed ... (errno ...)` | Snowflake auth or network; look up the errno |
+| `RuntimeError: Snowflake ... fetch failed ...` | View or district query failed (permissions, object missing) |
+
+**Deprecation WARNING every run** (`Geocodio API deprecation notice received`): Geocodio released a newer API version. Read their migration notes, then raise `GEOCODIO_API_VERSION` in `.env` (and the default in code and `.env.example`).
+
+**Many addresses skipped.** Below-threshold or street-level matches are skipped on purpose; DEBUG lines in the main log give each address ID and reason. Fix the address data in IC rather than lowering `ACCURACY_THRESHOLD`.
+
+**ODBC driver not found (macOS):** `Can't open lib 'ODBC Driver 18 for SQL Server'` means the driver isn't installed: `brew install microsoft/mssql-release/msodbcsql18`.
+
+**Snowflake connector pinned below 5.** 5.x logs a proxy WARNING on every connection (an alert every run). Upgrade deliberately, with that logger handled.
 
 ## File Structure
 
 ```
 Address-Geocoding/
-├── GeocodeAddresses.py    # Main application
-├── Dockerfile             # Docker image definition
-├── docker-compose.yml     # Docker Compose configuration
-├── requirements.txt       # Python dependencies
-├── .env                   # Environment configuration (not in git)
-├── .env.example           # Environment template
-├── .dockerignore          # Docker build exclusions
-├── .gitignore             # Git exclusions
-├── logs/                  # Application logs (persisted)
-│   └── geocoding.log
-├── Deprecated/            # Old/unused files
-└── README.md              # This file
+├── GeocodeAddresses.py     # The job
+├── tests/                  # Offline pytest suite (+ fixtures/ of captured Geocodio responses)
+├── vendor/                 # app_logger wheel (not on PyPI)
+├── docs/superpowers/       # Design docs and plans for past upgrades (historical)
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+├── requirements-dev.txt
+├── .env.example            # Configuration template (.env itself is git-ignored)
+├── CLAUDE.md               # Guidance for AI coding agents, incl. FERPA coding rules
+└── README.md
 ```

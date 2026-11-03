@@ -1,5 +1,7 @@
 # Geocodio API v1.9 → v1.12 Upgrade Implementation Plan
 
+> **Historical record.** Implemented and merged in Mapleton-IT/Address-Geocoding#1. Code has moved on since (e.g. API v2/v2.1, census2025, header auth, fatal-error handling); `README.md` and `CLAUDE.md` describe current behavior. Line numbers and smoke-test steps here are out of date — smoke-test via the Docker command in `README.md`, not by running the script locally.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Cut over the Address Geocoding application from Geocodio v1.9 to v1.12 while adding targeted hardening (env-driven version, guarded location lookup, deprecation signal capture, census enrichment metric, parser fixture tests) so future version bumps are cheap.
