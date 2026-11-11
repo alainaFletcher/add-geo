@@ -9,6 +9,7 @@ import logging
 from unittest.mock import MagicMock
 
 import pandas as pd
+import pyodbc
 import pytest
 
 import GeocodeAddresses as ga
@@ -76,6 +77,47 @@ def test_unmatched_district_clears_district_id():
     [(sql, params)] = _ic_writes([_row(DISTRICTID=0)])
     assert "districtID = ?" in sql
     assert params == (39.8, -104.9, "009307", "2018", "08001", None, 7)
+
+
+# --- write failures ---------------------------------------------------------
+
+def _ic_with_failures(fail_ids):
+    """IC connection whose UPDATE fails for the address IDs in fail_ids."""
+    def execute(sql, params):
+        if params[-1] in fail_ids:
+            raise pyodbc.ProgrammingError("42000", "[42000] UPDATE permission denied")
+    ic_conn = MagicMock()
+    ic_conn.cursor.return_value.execute.side_effect = execute
+    return ic_conn
+
+
+def test_scattered_write_failures_are_counted_not_fatal():
+    rows = [_row(ADDRESSID=i) for i in range(1, 11)]
+    ic_conn = _ic_with_failures({3, 7})
+    assert ga.update_ic_addresses(pd.DataFrame(rows), ic_conn) == (8, 2)
+
+
+def test_every_write_failing_is_fatal():
+    rows = [_row(ADDRESSID=i) for i in range(1, 3)]
+    with pytest.raises(ga.IcWriteError) as info:
+        ga.update_ic_addresses(pd.DataFrame(rows), _ic_with_failures({1, 2}))
+    assert "42000" in str(info.value)  # SQLSTATE survives for diagnosis
+
+
+def test_consecutive_write_failures_stop_the_step():
+    # Two succeed, then IC starts rejecting everything (e.g. permission revoked).
+    rows = [_row(ADDRESSID=i) for i in range(1, 21)]
+    ic_conn = _ic_with_failures(set(range(3, 21)))
+    with pytest.raises(ga.IcWriteError):
+        ga.update_ic_addresses(pd.DataFrame(rows), ic_conn)
+    attempts = ic_conn.cursor.return_value.execute.call_count
+    assert attempts == 2 + ga.MAX_CONSECUTIVE_IC_FAILURES  # stopped, didn't try all 20
+
+
+def test_rows_skipped_by_policy_are_not_write_failures():
+    # Nothing attempted means nothing failed: not an error.
+    assert ga.update_ic_addresses(
+        pd.DataFrame([_row(accuracy_type="street_center")]), MagicMock()) == (0, 0)
 
 
 # --- district matching ------------------------------------------------------

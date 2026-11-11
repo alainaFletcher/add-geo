@@ -145,6 +145,12 @@ celerybeat.pid
 .env.*
 !.env.example
 .envrc
+
+# Editor swap/lock/backup files: a swap file of .env (e.g. "..env.swp")
+# holds its secrets, and ".env.*" above does not match the leading dot.
+*.swp
+*.swo
+*~
 .venv
 env/
 venv/

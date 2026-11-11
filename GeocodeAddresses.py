@@ -79,6 +79,14 @@ API_FIELDS = ["school", "zip4", "census2025"]
 GEOCODIO_FATAL_STATUSES = frozenset({401, 403, 429})
 # Stop calling Geocodio after this many failures in a row (outage, network).
 MAX_CONSECUTIVE_GEOCODE_FAILURES = 5
+# Stop writing to IC after this many UPDATE failures in a row (lost
+# permission, schema change, IC down mid-run) and fail the run.
+MAX_CONSECUTIVE_IC_FAILURES = 5
+# pyodbc SQLSTATE for a rejected login: retrying only risks an account lockout.
+IC_LOGIN_FAILED_SQLSTATE = "28000"
+# SQLSTATEs a driver manager uses when it can't load the ODBC driver
+# (unixODBC "Can't open lib": 01000; Windows "data source not found": IM002).
+ODBC_DRIVER_NOT_LOADED_SQLSTATES = frozenset({"01000", "IM002"})
 
 # SQL Queries
 QUERY_ADDRESSES = """
@@ -197,9 +205,13 @@ def load_snowflake_private_key() -> bytes:
     """
     Load and decode the Snowflake RSA private key from environment variable.
 
-    The private key is expected as a base64-encoded PEM string in
-    SNOWFLAKE_PRIVATE_KEY_B64. An optional passphrase can be provided
-    in SNOWFLAKE_PRIVATE_KEY_PASSPHRASE if the key is encrypted.
+    SNOWFLAKE_PRIVATE_KEY_B64 may hold either form a key file is commonly
+    encoded in:
+      - base64 of the whole PEM file (`base64 -w0 rsa_key.p8`), or
+      - the PEM body alone, i.e. base64 of the DER key (the lines between
+        "-----BEGIN ... KEY-----" and "-----END ... KEY-----", joined).
+    An optional passphrase can be provided in SNOWFLAKE_PRIVATE_KEY_PASSPHRASE
+    if the key is encrypted.
 
     Returns:
         bytes: DER-encoded PKCS8 private key bytes (the format Snowflake expects)
@@ -211,10 +223,14 @@ def load_snowflake_private_key() -> bytes:
     if not SNOWFLAKE_PRIVATE_KEY_B64:
         raise EnvironmentError("SNOWFLAKE_PRIVATE_KEY_B64 is not set")
 
+    # Exception type only, raised from None: the key and its decode errors
+    # must never reach logs or notifications.
     try:
-        pem_bytes = base64.b64decode(SNOWFLAKE_PRIVATE_KEY_B64)
+        key_bytes = base64.b64decode(SNOWFLAKE_PRIVATE_KEY_B64)
     except Exception as e:
-        raise ValueError(f"Failed to base64-decode SNOWFLAKE_PRIVATE_KEY_B64: {e}")
+        raise ValueError(
+            f"Failed to base64-decode SNOWFLAKE_PRIVATE_KEY_B64: {type(e).__name__}"
+        ) from None
 
     passphrase = (
         SNOWFLAKE_PRIVATE_KEY_PASSPHRASE.encode()
@@ -222,10 +238,29 @@ def load_snowflake_private_key() -> bytes:
         else None
     )
 
+    # A PEM file starts with its "-----BEGIN" line; anything else is treated
+    # as raw DER (the decoded PEM body).
+    is_pem = key_bytes.lstrip().startswith(b"-----BEGIN")
+    key_format = "PEM" if is_pem else "DER"
+    loader = (serialization.load_pem_private_key if is_pem
+              else serialization.load_der_private_key)
+
+    # The messages below name only the format and whether a passphrase was
+    # set -- never key material or the library's own error text.
     try:
-        private_key = serialization.load_pem_private_key(pem_bytes, password=passphrase)
+        private_key = loader(key_bytes, password=passphrase)
+    except TypeError:
+        # cryptography raises TypeError for a passphrase/encryption mismatch.
+        hint = ("key is encrypted but SNOWFLAKE_PRIVATE_KEY_PASSPHRASE is not set"
+                if passphrase is None else
+                "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE is set but the key is not encrypted")
+        raise ValueError(f"Failed to load {key_format} private key: {hint}") from None
     except Exception as e:
-        raise ValueError(f"Failed to load PEM private key: {e}")
+        hint = ("wrong SNOWFLAKE_PRIVATE_KEY_PASSPHRASE, or not a valid key"
+                if passphrase is not None else "not a valid private key")
+        raise ValueError(
+            f"Failed to load {key_format} private key ({type(e).__name__}): {hint}"
+        ) from None
 
     private_key_der = private_key.private_bytes(
         encoding=serialization.Encoding.DER,
@@ -290,12 +325,16 @@ def create_snowflake_connection(database: str = SNOWFLAKE_DATABASE,
             logger.info(f"Successfully connected to Snowflake [{database}]")
             return conn
 
-        except sf_errors.ProgrammingError as e:
+        # OperationalError is the connector's network/backend failure (e.g.
+        # container network not ready yet): worth retrying. Auth and config
+        # errors (DatabaseError, ProgrammingError) fail the same way every
+        # time, so they fail fast below.
+        except sf_errors.OperationalError as e:
             logger.warning(f"Connection attempt {attempt} failed: {_describe_db_error(e)}")
 
             if attempt == max_retries:
                 logger.error("Failed to connect to Snowflake after all retries")
-                logger.error("Please check credentials and network connectivity")
+                logger.error("Please check network connectivity")
                 # from None: the chained driver error's text may name the user.
                 raise ConnectionError(
                     f"Snowflake connection failed: {_describe_db_error(e)}"
@@ -306,7 +345,8 @@ def create_snowflake_connection(database: str = SNOWFLAKE_DATABASE,
             retry_delay *= 2  # Exponential backoff
 
         except Exception as e:
-            logger.error(f"Unexpected error connecting to Snowflake: {_describe_db_error(e)}")
+            logger.error(f"Error connecting to Snowflake (not retried): {_describe_db_error(e)}")
+            logger.error("Please check credentials and configuration")
             raise ConnectionError(
                 f"Snowflake connection failed: {_describe_db_error(e)}"
             ) from None
@@ -348,9 +388,31 @@ def create_ic_connection() -> pyodbc.Connection:
         except pyodbc.Error as e:
             logger.warning(f"IC connection attempt {attempt} failed: {_describe_db_error(e)}")
 
-            if attempt == max_retries:
-                logger.error("Failed to connect to Infinite Campus after all retries")
-                logger.error("Please check credentials and network connectivity")
+            # A rejected login fails the same way every time; retrying it
+            # only adds failed attempts toward an account lockout.
+            sqlstate = str(e.args[0]) if e.args else ""
+            login_rejected = sqlstate == IC_LOGIN_FAILED_SQLSTATE
+            # unixODBC reports a driver it can't load as SQLSTATE 01000
+            # ("Can't open lib"); Windows' driver manager as IM002. Neither
+            # heals by waiting, and the driver name is not sensitive.
+            driver_missing = (sqlstate in ODBC_DRIVER_NOT_LOADED_SQLSTATES
+                              and IC_DB_DRIVER not in pyodbc.drivers())
+
+            if driver_missing:
+                logger.error(f"ODBC driver '{IC_DB_DRIVER}' is not installed "
+                             f"(installed: {pyodbc.drivers() or 'none'})")
+                raise ConnectionError(
+                    f"Infinite Campus connection failed: ODBC driver '{IC_DB_DRIVER}' "
+                    f"is not installed ({_describe_db_error(e)})"
+                ) from None
+
+            if login_rejected or attempt == max_retries:
+                if login_rejected:
+                    logger.error("Infinite Campus rejected the login (not retried)")
+                    logger.error("Please check IC_DB_USER / IC_DB_PASSWORD")
+                else:
+                    logger.error("Failed to connect to Infinite Campus after all retries")
+                    logger.error("Please check credentials and network connectivity")
                 # from None: pyodbc's "Login failed for user '...'" must not chain in.
                 raise ConnectionError(
                     f"Infinite Campus connection failed: {_describe_db_error(e)}"
@@ -759,8 +821,9 @@ def parse_geocode_results(api_results: list, addresses_df: pd.DataFrame) -> pd.D
         return results_df
 
     except Exception as e:
-        logger.error(f"Error parsing geocoding results: {e}")
-        raise
+        # Type only, from None: pandas errors can echo row values (addresses).
+        logger.error(f"Error parsing geocoding results: {type(e).__name__}")
+        raise RuntimeError(f"Parsing geocoding results failed: {type(e).__name__}") from None
 
 
 def enrich_with_district_ids(results_df: pd.DataFrame, districts_df: pd.DataFrame) -> pd.DataFrame:
@@ -821,8 +884,9 @@ def enrich_with_district_ids(results_df: pd.DataFrame, districts_df: pd.DataFram
         return results_df
 
     except Exception as e:
-        logger.error(f"Error enriching with district IDs: {e}")
-        raise
+        # Type only, from None: pandas errors can echo row values.
+        logger.error(f"Error enriching with district IDs: {type(e).__name__}")
+        raise RuntimeError(f"District ID enrichment failed: {type(e).__name__}") from None
 
 
 # ============================================
@@ -903,6 +967,14 @@ def log_results_to_snowflake(results_df: pd.DataFrame, snowflake_conn: Snowflake
 # Infinite Campus Update Functions
 # ============================================
 
+class IcWriteError(RuntimeError):
+    """IC rejected too many UPDATEs for the run to count as successful.
+
+    The message carries only counts and error codes (from
+    _describe_db_error) -- never row values or driver message text.
+    """
+
+
 def update_ic_addresses(results_df: pd.DataFrame, ic_conn: pyodbc.Connection,
                         accuracy_threshold: float = ACCURACY_THRESHOLD) -> Tuple[int, int]:
     """
@@ -922,7 +994,9 @@ def update_ic_addresses(results_df: pd.DataFrame, ic_conn: pyodbc.Connection,
         Tuple[int, int]: (success_count, error_count)
 
     Raises:
-        Exception: If critical database error occurs
+        IcWriteError: after MAX_CONSECUTIVE_IC_FAILURES failed UPDATEs in a
+            row, or when every attempted UPDATE failed. Rows committed before
+            the abort stay written.
     """
     logger.info(f"Updating Infinite Campus addresses (accuracy threshold: {accuracy_threshold})...")
 
@@ -930,6 +1004,8 @@ def update_ic_addresses(results_df: pd.DataFrame, ic_conn: pyodbc.Connection,
     success_count = 0
     error_count = 0
     skipped_count = 0
+    consecutive_failures = 0
+    last_failure = None
 
     try:
         for idx, row in results_df.iterrows():
@@ -974,6 +1050,8 @@ def update_ic_addresses(results_df: pd.DataFrame, ic_conn: pyodbc.Connection,
                     f"writing blanks for missing tract/block/location_code"
                 )
 
+            # IcWriteError is raised after the except blocks so the driver
+            # error (which can echo row values) is never chained onto it.
             try:
                 sql_update = """
                     UPDATE ADDRESS
@@ -984,18 +1062,34 @@ def update_ic_addresses(results_df: pd.DataFrame, ic_conn: pyodbc.Connection,
 
                 cursor.execute(sql_update, args)
                 cursor.commit()
+            except pyodbc.Error as e:
+                failure = _describe_db_error(e)
+                logger.warning(f"Failed to update address ID {address_id} in IC: {failure}")
+            except Exception as e:
+                failure = _describe_db_error(e)
+                logger.warning(f"Unexpected error updating address ID {address_id}: {failure}")
+            else:
                 success_count += 1
-
+                consecutive_failures = 0
                 if success_count % 50 == 0:
                     logger.info(f"IC update progress: {success_count} addresses updated...")
+                continue
 
-            except pyodbc.Error as e:
-                logger.warning(f"Failed to update address ID {address_id} in IC: {_describe_db_error(e)}")
-                error_count += 1
+            error_count += 1
+            last_failure = failure
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_IC_FAILURES:
+                logger.error(f"Aborting IC update after {consecutive_failures} consecutive failures")
+                raise IcWriteError(
+                    f"{consecutive_failures} consecutive IC update failures "
+                    f"({success_count} written before abort; last: {failure})"
+                )
 
-            except Exception as e:
-                logger.warning(f"Unexpected error updating address ID {address_id}: {_describe_db_error(e)}")
-                error_count += 1
+        # Small batches can't reach the streak limit; every write failing
+        # still means IC could not be updated this run.
+        if success_count == 0 and error_count > 0:
+            logger.error("No successful IC updates this run")
+            raise IcWriteError(f"All {error_count} IC updates failed (last: {last_failure})")
 
         logger.info(f"IC update complete: {success_count} updated, {error_count} errors, {skipped_count} skipped")
         return success_count, error_count

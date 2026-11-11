@@ -79,7 +79,7 @@ cp .env.example .env    # then fill in real values; never commit .env
 
 | Variable | Default | Notes |
 |----------|---------|-------|
-| `SNOWFLAKE_USER`, `SNOWFLAKE_PRIVATE_KEY_B64` | (required) | Base64-encoded PEM; optional `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE` |
+| `SNOWFLAKE_USER`, `SNOWFLAKE_PRIVATE_KEY_B64` | (required) | Base64 of the whole PEM file (`base64 -w0 rsa_key.p8`), or the PEM body alone (the lines between `-----BEGIN`/`-----END`, joined); optional `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE` for an encrypted key |
 | `IC_DB_USER`, `IC_DB_PASSWORD` | (required) | |
 | `GEOCODIO_API_KEY` | (required) | |
 | `GEOCODIO_API_VERSION` | `v2.1` | Bump here when Geocodio publishes a new version (the job logs a deprecation WARNING when it does) |
@@ -108,6 +108,24 @@ docker compose run --rm -e BATCH_SIZE=1 geocoding       # smoke test
 
 - **Rebuild after every change.** `run --rm` reuses the existing `address-geocoding:latest` image; without `build`, the old code keeps running.
 - **Every run writes to production IC.** There is no dry-run mode. A `BATCH_SIZE=1` smoke test updates at most one real address (often zero, if it scores below the threshold). Check the `RUN_END` line: `status`, `steps_total: 8`, `warning_count`.
+- **Check a new image without running the job** (nothing touches production):
+
+  ```bash
+  docker run --rm address-geocoding:latest sh -c "odbcinst -q -d; command -v curl gpg || echo purged"
+  docker run --rm address-geocoding:latest python -c "import pyodbc,snowflake.connector,pandas,app_logger; print(pyodbc.drivers())"
+  ```
+
+  Expect `[ODBC Driver 18 for SQL Server]`, `purged`, and `['ODBC Driver 18 for SQL Server']`.
+- **Refresh monthly for security fixes:** `docker compose build --pull --no-cache`, then the smoke test. A plain `build` reuses the cached base image and apt layer, so OS and driver fixes never arrive otherwise.
+
+### Image hardening
+
+- Base `python:3.13-slim-bookworm`, matching Microsoft's `debian/12` repo for `msodbcsql18`. The repo line is written in the Dockerfile, not downloaded. Set the `MS_KEY_FINGERPRINT` build arg (from Microsoft's docs) to make the build fail if Microsoft's signing key doesn't match.
+- One apt layer; `curl` and `gnupg` are purged after the repo is added, and `unixodbc-dev` isn't installed (pip installs wheels only, `--only-binary=:all:`, so nothing is compiled).
+- The app_logger wheel is copied by exact name and installed with `--no-deps`. When it's upgraded, change its name in the Dockerfile.
+- Runs as `appuser` (UID 10001). The app code is root-owned; only `/app/logs` is writable.
+- Compose: `init: true` (tini), `stop_grace_period: 90s` so a stopped run can still send its FAILED notifications, `cap_drop: [ALL]`, `no-new-privileges`, and no fixed `container_name` (a leftover container can't block the next cron run).
+- Not yet done (needs values from you): pinning the base image by digest, and a hashed `requirements.lock`.
 
 ## Running Locally
 
@@ -230,7 +248,7 @@ Logs carry address IDs, counts, error types, and error codes only. The code guar
 | Code | Meaning |
 |------|---------|
 | 0 | `SUCCESS`, `PARTIAL` (some rows or the non-fatal audit step failed), or `SKIPPED` (nothing to geocode) |
-| 1 | `FAILED`: a fatal step failed or Geocodio stopped the batch |
+| 1 | `FAILED`: a fatal step failed, Geocodio stopped the batch, or IC rejected the writes (5 in a row, or all of them) |
 | 143 | Terminated by SIGTERM (run recorded `FAILED`) |
 
 The real outcome, including `PARTIAL`, is in the run index and `RUN_END` line.
@@ -244,8 +262,12 @@ The real outcome, including `PARTIAL`, is in the run index and `RUN_END` line.
 | `GeocodioFatalError ... (HTTP 403)` | Invalid/revoked API key or daily quota used up |
 | `GeocodioFatalError ... (HTTP 429)` | Pay-as-you-go rate limit |
 | `GeocodioFatalError ... consecutive ...` or `No successful Geocodio lookups` | Geocodio outage or network problem |
-| `ConnectionError: Infinite Campus connection failed ... (SQLSTATE 28000)` | IC login failed (credentials) |
-| `ConnectionError: Snowflake connection failed ... (errno ...)` | Snowflake auth or network; look up the errno |
+| `ConnectionError: Infinite Campus connection failed: ODBC driver '...' is not installed` | Microsoft ODBC Driver 18 missing on this machine (not retried). Linux/WSL: install `msodbcsql18` from Microsoft's repo; macOS: `brew install microsoft/mssql-release/msodbcsql18` |
+| `ConnectionError: Infinite Campus connection failed ... (SQLSTATE 28000)` | IC login failed (credentials); tried once, not retried, to avoid an account lockout |
+| `ConnectionError: Snowflake connection failed ... OperationalError ...` | Snowflake network problem (retried 3 times first) |
+| `ConnectionError: Snowflake connection failed ... DatabaseError/ProgrammingError ...` | Snowflake auth or config; look up the errno (not retried) |
+| `IcWriteError: ... consecutive IC update failures` or `All ... IC updates failed` | IC rejected the UPDATEs (permissions, schema change, IC down mid-run); the SQLSTATE says which. Rows written before the stop are kept |
+| `RuntimeError: Parsing geocoding results failed` / `District ID enrichment failed` | Unexpected data shape; the error type is in the message |
 | `RuntimeError: Snowflake ... fetch failed ...` | View or district query failed (permissions, object missing) |
 
 **Deprecation WARNING every run** (`Geocodio API deprecation notice received`): Geocodio released a newer API version. Read their migration notes, then raise `GEOCODIO_API_VERSION` in `.env` (and the default in code and `.env.example`).

@@ -4,14 +4,28 @@ services:
       context: .
       dockerfile: Dockerfile
     image: address-geocoding:latest
-    container_name: address-geocoding
+    # No container_name: with `run --rm`, a fixed name makes a leftover
+    # container (SIGKILL, host crash) or an overlapping manual run block cron.
+
+    # tini as PID 1: forwards SIGTERM and reaps children. Exit codes
+    # (including 143) pass through unchanged.
+    init: true
+    # On SIGTERM, app_logger's finish() writes to Snowflake and sends
+    # email/Teams (30s timeout each); Docker's default 10s would cut that off.
+    stop_grace_period: 90s
+
+    # The job needs no Linux capabilities and never escalates privileges.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
     env_file:
       - .env
     environment:
+      # Must override .env (logs go to the mounted LogReader volume).
+      # CONSOLE_FORMAT and PYTHONUNBUFFERED are set in the Dockerfile.
       - APP_LOG_ROOT=/app/logs
-      - CONSOLE_FORMAT=json
-      - PYTHONUNBUFFERED=1
     volumes:
       - ../LogReader/logs:/app/logs
     logging:

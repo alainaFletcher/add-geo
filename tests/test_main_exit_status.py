@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
+import pyodbc
 import pytest
 
 import GeocodeAddresses as ga
@@ -108,6 +109,13 @@ def test_geocodio_abort_still_writes_rows_geocoded_before_it(pipeline, monkeypat
     updates = pipeline.ic.cursor.return_value.execute.call_args_list
     assert [call.args[1][-1] for call in updates] == [42]  # WHERE addressid = ?
     assert [s["step"] for s in pipeline.record["failed_steps"]] == ["geocode_addresses"]
+
+
+def test_ic_rejecting_every_write_exits_nonzero_with_failed_status(pipeline):
+    pipeline.ic.cursor.return_value.execute.side_effect = pyodbc.ProgrammingError(
+        "42000", "[42000] UPDATE permission denied on ADDRESS")
+    assert pipeline() == (1, "FAILED")
+    assert [s["step"] for s in pipeline.record["failed_steps"]] == ["update_ic"]
 
 
 def test_snowflake_close_failure_does_not_fail_a_finished_run(pipeline, monkeypatch):

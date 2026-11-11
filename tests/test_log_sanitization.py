@@ -118,5 +118,46 @@ def test_ic_update_failure_logs_no_row_content(caplog, error):
         "county_fips": "08001", "DISTRICTID": 17,
     }])
 
-    assert ga.update_ic_addresses(results, ic_conn) == (0, 1)
-    assert SECRET_STREET not in caplog.text
+    # Every write failing is fatal; the raised error must be clean too.
+    with pytest.raises(ga.IcWriteError) as info:
+        ga.update_ic_addresses(results, ic_conn)
+    assert SECRET_STREET not in _full_error_text(info.value) + caplog.text
+
+
+def _leaky(*args, **kwargs):
+    """Stand-in for a pandas error whose message echoes a row value."""
+    raise ValueError(f"cannot convert '1 {SECRET_STREET} Ln'")
+
+
+def test_parse_failure_raises_type_only(caplog, monkeypatch):
+    caplog.set_level(logging.DEBUG)
+    # Fail both the row parser and its per-row fallback, so the error
+    # reaches parse_geocode_results' outer handler.
+    monkeypatch.setattr(ga, "_parse_result", _leaky)
+    monkeypatch.setattr(ga, "_failed_row", _leaky)
+    addresses = pd.DataFrame([{"ADDRESSID": 7, "ADDRESSLINE1": "x"}])
+
+    with pytest.raises(RuntimeError) as info:
+        ga.parse_geocode_results([{"results": []}], addresses)
+    assert SECRET_STREET not in _full_error_text(info.value) + caplog.text
+
+
+def test_enrich_failure_raises_type_only(caplog):
+    caplog.set_level(logging.DEBUG)
+    districts = MagicMock()
+    districts.index = [805550]
+    districts.loc.__getitem__.side_effect = _leaky
+    results = pd.DataFrame([{"ADDRESSID": 7, "success": True, "lea_code": "0805550"}])
+
+    with pytest.raises(RuntimeError) as info:
+        ga.enrich_with_district_ids(results, districts)
+    assert SECRET_STREET not in _full_error_text(info.value) + caplog.text
+
+
+def test_snowflake_key_errors_carry_no_key_material(monkeypatch):
+    monkeypatch.setattr(ga, "SNOWFLAKE_PRIVATE_KEY_B64", "bm90IGEgcGVt")  # "not a pem"
+    with pytest.raises(ValueError) as info:
+        ga.load_snowflake_private_key()
+    text = _full_error_text(info.value)
+    assert "not a pem" not in text and "bm90IGEgcGVt" not in text
+    assert info.value.__suppress_context__
