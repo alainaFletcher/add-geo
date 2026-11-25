@@ -377,7 +377,7 @@ def create_ic_connection() -> pyodbc.Connection:
                 f"Database={IC_DB_DATABASE};"
                 f"UID={IC_DB_USER};"
                 f"PWD={IC_DB_PASSWORD};"
-                "TrustServerCertificate=yes;"
+                "Encrypt=yes;TrustServerCertificate=yes;"
             )
 
             conn = pyodbc.connect(connection_string)
