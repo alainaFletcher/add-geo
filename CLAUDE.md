@@ -104,13 +104,14 @@ Tests are offline. `tests/conftest.py` disables `.env` loading (`PYTHON_DOTENV_D
 
 ## Docker
 
-- **Dockerfile**: `python:3.13-slim-bookworm` (Debian 12, to match Microsoft's `debian/12` repo for ODBC Driver 18; don't move to trixie unless Microsoft's repo for it carries `msodbcsql18`). One apt layer: `curl`/`gnupg` are purged after adding the repo; no `unixodbc-dev` (nothing is compiled: pip runs with `--only-binary=:all:`). Optional `MS_KEY_FINGERPRINT` build arg enforces Microsoft's key fingerprint.
+- **Dockerfile**: `python:3.13-slim-bookworm` (Debian 12, to match Microsoft's `debian/12` repo for ODBC Driver 18; don't move to trixie unless Microsoft's repo for it carries `msodbcsql18`). One apt layer: `curl`/`gnupg` are purged (`--auto-remove`) after adding the repo; `libgssapi-krb5-2` is installed explicitly next to `msodbcsql18` because the driver links it but the package doesn't declare it, so purging curl used to delete it and every IC connect failed with SQLSTATE `01000` ("Can't open lib"). Any library the driver needs that only curl/gnupg pull in must be named on that install line. No `unixodbc-dev` (nothing is compiled: pip runs with `--only-binary=:all:`). Optional `MS_KEY_FINGERPRINT` build arg enforces Microsoft's key fingerprint.
 - **app_logger wheel**: copied by exact filename and installed `--no-deps`; when upgrading it, update the filename in the Dockerfile.
 - **Volume**: `../LogReader/logs:/app/logs` — shared with LogReader dashboard
 - **Non-root**: Runs as `appuser` (UID 10001); app code is root-owned, only `/app/logs` is writable
 - **Exec-form CMD**: Ensures SIGTERM reaches Python for graceful shutdown
 - **Compose**: `init: true`, `stop_grace_period: 90s` (app_logger's SIGTERM handler sends notifications with 30s timeouts), `cap_drop: [ALL]`, `no-new-privileges`, no `container_name`. Cron uses `/usr/local/bin/docker-compose`; keep the file compatible with it (no Compose-v2-only keys such as `pull_policy` unless that binary is confirmed to be v2).
-- **Checking an image without a production run**: `docker run --rm address-geocoding:latest sh -c "odbcinst -q -d"` and `... python -c "import pyodbc, snowflake.connector, pandas, app_logger"` (see README)
+- **ODBC build guard**: `check_odbc_driver.py` runs as `appuser` at build time (`RUN python check_odbc_driver.py`): it connects through pyodbc to a closed localhost port with no credentials, passes on a network SQLSTATE (`08001`/`HYT00`), and fails the build on `01000`/`IM002` (driver not loadable), printing `ldd` of the driver. Don't replace it with an `ldd`-only check: `ldd` misses libraries the driver opens at runtime, permissions, and resource files.
+- **Checking an image without a production run**: `docker run --rm address-geocoding:latest python check_odbc_driver.py`, `... sh -c "odbcinst -q -d"`, and `... python -c "import pyodbc, snowflake.connector, pandas, app_logger"` (see README)
 
 ## Database Connections
 
