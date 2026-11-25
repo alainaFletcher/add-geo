@@ -113,15 +113,19 @@ docker compose run --rm -e BATCH_SIZE=1 geocoding       # smoke test
   ```bash
   docker run --rm address-geocoding:latest sh -c "odbcinst -q -d; command -v curl gpg || echo purged"
   docker run --rm address-geocoding:latest python -c "import pyodbc,snowflake.connector,pandas,app_logger; print(pyodbc.drivers())"
+  docker run --rm address-geocoding:latest python check_odbc_driver.py
+  docker run --rm address-geocoding:latest sh -c "ldd /opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.*.so.* | grep -E 'gssapi|not found'"
   ```
 
-  Expect `[ODBC Driver 18 for SQL Server]`, `purged`, and `['ODBC Driver 18 for SQL Server']`.
+  Expect `[ODBC Driver 18 for SQL Server]`, `purged`, `['ODBC Driver 18 for SQL Server']`, `OK: ODBC Driver 18 for SQL Server loads (expected connect failure, SQLSTATE 08001)` (or `HYT00`), and a `libgssapi_krb5.so.2 => /lib/...` line with no `not found`.
 - **Refresh monthly for security fixes:** `docker compose build --pull --no-cache`, then the smoke test. A plain `build` reuses the cached base image and apt layer, so OS and driver fixes never arrive otherwise.
 
 ### Image hardening
 
 - Base `python:3.13-slim-bookworm`, matching Microsoft's `debian/12` repo for `msodbcsql18`. The repo line is written in the Dockerfile, not downloaded. Set the `MS_KEY_FINGERPRINT` build arg (from Microsoft's docs) to make the build fail if Microsoft's signing key doesn't match.
-- One apt layer; `curl` and `gnupg` are purged after the repo is added, and `unixodbc-dev` isn't installed (pip installs wheels only, `--only-binary=:all:`, so nothing is compiled).
+- One apt layer; `curl` and `gnupg` are purged (with `--auto-remove`) after the repo is added, and `unixodbc-dev` isn't installed (pip installs wheels only, `--only-binary=:all:`, so nothing is compiled).
+- `libgssapi-krb5-2` is installed explicitly alongside `msodbcsql18`. The driver links it, but the package doesn't declare it, so purging curl (its only other source) removed it and the driver couldn't load.
+- Build guard: `check_odbc_driver.py` runs as `appuser` during the build and loads the driver through pyodbc against a closed localhost port (no credentials, no database). If the driver can't be loaded, the build fails and prints `ldd` output naming the missing library.
 - The app_logger wheel is copied by exact name and installed with `--no-deps`. When it's upgraded, change its name in the Dockerfile.
 - Runs as `appuser` (UID 10001). The app code is root-owned; only `/app/logs` is writable.
 - Compose: `init: true` (tini), `stop_grace_period: 90s` so a stopped run can still send its FAILED notifications, `cap_drop: [ALL]`, `no-new-privileges`, and no fixed `container_name` (a leftover container can't block the next cron run).
@@ -263,6 +267,7 @@ The real outcome, including `PARTIAL`, is in the run index and `RUN_END` line.
 | `GeocodioFatalError ... (HTTP 429)` | Pay-as-you-go rate limit |
 | `GeocodioFatalError ... consecutive ...` or `No successful Geocodio lookups` | Geocodio outage or network problem |
 | `ConnectionError: Infinite Campus connection failed: ODBC driver '...' is not installed` | Microsoft ODBC Driver 18 missing on this machine (not retried). Linux/WSL: install `msodbcsql18` from Microsoft's repo; macOS: `brew install microsoft/mssql-release/msodbcsql18` |
+| `ConnectionError: Infinite Campus connection failed: Error (SQLSTATE 01000)`, each attempt failing within milliseconds | The driver is registered but can't be loaded (unixODBC "Can't open lib ... file not found"), usually a missing shared library. Run `docker run --rm address-geocoding:latest python check_odbc_driver.py` to see the `ldd` output, add the missing package to the `msodbcsql18` install line in the Dockerfile, and rebuild. Not a credentials or network problem |
 | `ConnectionError: Infinite Campus connection failed ... (SQLSTATE 28000)` | IC login failed (credentials); tried once, not retried, to avoid an account lockout |
 | `ConnectionError: Snowflake connection failed ... OperationalError ...` | Snowflake network problem (retried 3 times first) |
 | `ConnectionError: Snowflake connection failed ... DatabaseError/ProgrammingError ...` | Snowflake auth or config; look up the errno (not retried) |
@@ -283,6 +288,7 @@ The real outcome, including `PARTIAL`, is in the run index and `RUN_END` line.
 ```
 Address-Geocoding/
 ├── GeocodeAddresses.py     # The job
+├── check_odbc_driver.py    # Docker build guard: fails the build if ODBC Driver 18 can't load
 ├── tests/                  # Offline pytest suite (+ fixtures/ of captured Geocodio responses)
 ├── vendor/                 # app_logger wheel (not on PyPI)
 ├── docs/superpowers/       # Design docs and plans for past upgrades (historical)
