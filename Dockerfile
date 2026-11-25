@@ -20,6 +20,12 @@ ARG MS_KEY_FINGERPRINT=""
 
 # One layer: runtime ODBC (unixodbc) + Microsoft ODBC Driver 18. curl and
 # gnupg are needed only to add the repo and are purged in the same layer.
+# libgssapi-krb5-2 is linked by libmsodbcsql-18 but not declared in
+# msodbcsql18's Depends; only curl (via libcurl4) pulled it in, so
+# `purge --auto-remove curl` deleted it and the driver failed to load
+# (SQLSTATE 01000 "Can't open lib"). Naming it here marks it manually
+# installed, so --auto-remove keeps it. check_odbc_driver.py (below) fails
+# the build if the driver can't load for any reason.
 # unixodbc-dev is not installed: nothing is compiled (pip uses wheels only).
 RUN set -eu; \
     apt-get update; \
@@ -34,7 +40,7 @@ RUN set -eu; \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
         > /etc/apt/sources.list.d/mssql-release.list; \
     apt-get update; \
-    ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18; \
+    ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 libgssapi-krb5-2; \
     apt-get purge -y --auto-remove curl gnupg; \
     rm -rf /var/lib/apt/lists/* /tmp/microsoft.asc
 
@@ -53,9 +59,16 @@ RUN pip install --no-cache-dir --no-deps /tmp/app_logger-2.1.1-py3-none-any.whl 
     && pip install --no-cache-dir --only-binary=:all: -r requirements.txt \
     && rm -f /tmp/app_logger-2.1.1-py3-none-any.whl
 
-COPY GeocodeAddresses.py .
+COPY check_odbc_driver.py .
 
 USER appuser
+
+# Build guard: load ODBC Driver 18 through pyodbc as appuser, exactly as the
+# job does (connects only to a closed localhost port). Fails the build, with
+# ldd output naming the missing library, if the driver can't be loaded.
+RUN python check_odbc_driver.py
+
+COPY GeocodeAddresses.py .
 
 # Exec form so SIGTERM reaches Python for graceful shutdown.
 CMD ["python", "GeocodeAddresses.py"]
